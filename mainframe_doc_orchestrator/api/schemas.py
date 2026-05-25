@@ -46,7 +46,6 @@ class DocumentCreateRequest(BaseModel):
     # simple=9, medium=15 (default), complex=25
     jcl_complexity: Literal["simple", "medium", "complex"] = "medium"
     filters: RetrievalFiltersModel = Field(default_factory=RetrievalFiltersModel)
-    retrieval_request: RetrievalRequestModel | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
 
 

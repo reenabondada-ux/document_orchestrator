@@ -15,6 +15,7 @@ class PromptEngine:
         section: DocumentSection,
         evidence_pack: EvidencePack,
         prior_pass_count: int,
+        prior_drafts: dict[str, str] | None = None,
     ) -> tuple[str, str]:
         prompt_bundle = PROMPTS[section.section_name]
         context = {
@@ -32,9 +33,17 @@ class PromptEngine:
             "supporting_data": evidence_pack.supporting_data,
             "evidence_items": [asdict(item) for item in evidence_pack.evidence_items],
             "confidence": evidence_pack.confidence,
+            "prior_section_drafts": self._format_prior_drafts(prior_drafts or {}),
         }
         user_prompt = render_template(prompt_bundle["user"], context)
         return prompt_bundle["system"], user_prompt
+
+    @staticmethod
+    def _format_prior_drafts(prior_drafts: dict[str, str]) -> str:
+        if not prior_drafts:
+            return ""
+        parts = [f"### {name}\n{draft}" for name, draft in prior_drafts.items()]
+        return "\n\n".join(parts)
 
     @staticmethod
     def _path_as_dict(path: Any) -> dict[str, Any]:

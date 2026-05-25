@@ -3,22 +3,16 @@
 ## Executive Summary
 [Generated]
 
-## System Scope
+## Application Overview
 [Generated]
 
-## Application Landscape
+## JCL Jobs and Procedures
 [Generated]
 
-## Batch Flow Overview
-[Generated]
-
-## Program Inventory
+## COBOL Programs
 [Generated]
 
 ## Copybooks and Data Structures
-[Generated]
-
-## Business Rules
 [Generated]
 
 ## Operational Behavior

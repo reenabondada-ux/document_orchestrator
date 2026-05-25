@@ -24,12 +24,14 @@ class SectionDraftWriter:
         section: DocumentSection,
         evidence_pack: EvidencePack,
         prior_pass_count: int = 0,
+        prior_drafts: dict[str, str] | None = None,
     ) -> str:
         system_prompt, user_prompt = self.prompt_engine.build_section_prompts(
             request=request,
             section=section,
             evidence_pack=evidence_pack,
             prior_pass_count=prior_pass_count,
+            prior_drafts=prior_drafts,
         )
         return await self.llm_client.generate(
             system_prompt=system_prompt,

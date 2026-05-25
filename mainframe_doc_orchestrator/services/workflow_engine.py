@@ -79,6 +79,30 @@ class DocumentWorkflowEngine:
             raise ValueError("No matching section available for generation.")
 
         document_section = self._document_section_from_state(section_state)
+
+        # Dependency guard: Phase 2 sections require all depends_on sections to be
+        # review_ready or approved before generation can proceed.
+        if document_section.depends_on:
+            not_ready = [
+                dep
+                for dep in document_section.depends_on
+                if self._get_section_state(plan, dep).get("status")
+                not in {"review_ready", "approved"}
+            ]
+            if not_ready:
+                raise ValueError(
+                    f"Section '{document_section.section_name}' depends on sections that "
+                    f"are not yet review_ready or approved: {not_ready}"
+                )
+
+        # Collect prior drafts for synthesis sections.
+        prior_drafts: dict[str, str] | None = None
+        if document_section.depends_on:
+            prior_drafts = {
+                dep: self._get_section_state(plan, dep).get("draft_markdown", "")
+                for dep in document_section.depends_on
+            }
+
         prior_pass_count = await self.retrieval_pass_repository.next_pass_number(
             run_id, document_section.section_name
         )
@@ -120,6 +144,7 @@ class DocumentWorkflowEngine:
             section=document_section,
             evidence_pack=evidence_pack,
             prior_pass_count=prior_pass_count - 1,
+            prior_drafts=prior_drafts,
         )
         notes = self.validator.validate_section(section_markdown, evidence_pack)
         section_state.update(
@@ -269,6 +294,8 @@ class DocumentWorkflowEngine:
             section.setdefault("retrieval_pass_id", None)
             section.setdefault("retrieval_pass_number", None)
             section.setdefault("updated_at", self._now_iso())
+            section.setdefault("asset_type_filter", [])
+            section.setdefault("depends_on", [])
         return plan_dict
 
     def _document_request_from_plan(
@@ -313,8 +340,14 @@ class DocumentWorkflowEngine:
         if existing and existing.section_name == section.section_name:
             return existing
         filters_data = metadata.get("filters", {})
+        # Section-level asset_type_filter takes precedence over plan-level filters.
+        asset_types = (
+            list(section.asset_type_filter)
+            if section.asset_type_filter
+            else list(filters_data.get("asset_types", []))
+        )
         filters = RetrievalFilters(
-            asset_types=list(filters_data.get("asset_types", [])),
+            asset_types=asset_types,
             asset_ids=list(filters_data.get("asset_ids", [])),
             domains=list(filters_data.get("domains", [])),
         )
@@ -353,6 +386,8 @@ class DocumentWorkflowEngine:
             retrieval_hint=section_state.get("retrieval_hint", ""),
             min_chunks=int(section_state.get("min_chunks", 1)),
             min_paths=int(section_state.get("min_paths", 0)),
+            asset_type_filter=list(section_state.get("asset_type_filter", [])),
+            depends_on=list(section_state.get("depends_on", [])),
         )
 
     @staticmethod

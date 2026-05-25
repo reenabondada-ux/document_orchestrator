@@ -84,6 +84,13 @@ class DocumentSection:
     min_chunks: int = 1
     min_paths: int = 0
     max_tokens: int = 0  # 0 = use global draft_writer_max_tokens
+    # Asset types forwarded to RetrievalFilters.asset_types.
+    # Empty list = no filter (retrieve across all types).
+    asset_type_filter: list[str] = field(default_factory=list)
+    # Section names that must be review_ready/approved before this section
+    # can be generated.  Used for synthesis sections (application_overview,
+    # executive_summary) that consume prior draft text rather than raw retrieval.
+    depends_on: list[str] = field(default_factory=list)
 
 @dataclass(slots=True)
 class SectionDraft:

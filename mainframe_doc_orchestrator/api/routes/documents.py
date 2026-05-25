@@ -28,8 +28,6 @@ from mainframe_doc_orchestrator.api.schemas import (
 )
 from mainframe_doc_orchestrator.models import (
     DocumentRequest,
-    RetrievalRequest,
-    RetrievalFilters,
 )
 from mainframe_doc_orchestrator.services.previewer import (
     render_dashboard_html,
@@ -41,65 +39,17 @@ router = APIRouter(prefix="/documents", tags=["documents"])
 
 
 def _to_domain_request(payload: DocumentCreateRequest) -> DocumentRequest:
-    # Resolve effective top_k_paths: explicit value wins; otherwise derive from complexity hint.
+    # Resolve effective top_k_paths: explicit value wins; otherwise derive from
+    # complexity hint.  The resolved values are stored in metadata so that
+    # _build_retrieval_request in workflow_engine can use them per-section.
+    # No RetrievalRequest is constructed here — POST /documents only creates a plan;
+    # retrieval happens later, once per section, inside generate_section.
     effective_top_k_paths = (
         payload.top_k_paths
         if payload.top_k_paths is not None
         else JCL_COMPLEXITY_TOP_K[payload.jcl_complexity]
     )
 
-    retrieval_request = payload.retrieval_request
-    if retrieval_request is None and (payload.topic or payload.scope):
-        retrieval_request = {
-            "query": payload.topic or payload.scope,
-            "section_name": "batch_flow_overview",
-            "system_id": payload.system_id,
-            "top_k_chunks": payload.top_k_chunks,
-            "top_k_paths": effective_top_k_paths,
-            "filters": {
-                "asset_types": payload.filters.asset_types,
-                "asset_ids": payload.filters.asset_ids,
-                "domains": payload.filters.domains,
-            },
-        }
-    req_obj = None
-    if retrieval_request is not None:
-        req_obj = RetrievalRequest(
-            query=retrieval_request.query
-            if hasattr(retrieval_request, "query")
-            else retrieval_request["query"],
-            section_name=retrieval_request.section_name
-            if hasattr(retrieval_request, "section_name")
-            else retrieval_request["section_name"],
-            system_id=payload.system_id,
-            top_k_chunks=retrieval_request.top_k_chunks
-            if hasattr(retrieval_request, "top_k_chunks")
-            else retrieval_request["top_k_chunks"],
-            top_k_paths=effective_top_k_paths,
-            filters=RetrievalFilters(
-                asset_types=list(
-                    (
-                        retrieval_request.filters.asset_types
-                        if hasattr(retrieval_request, "filters")
-                        else retrieval_request["filters"]["asset_types"]
-                    )
-                ),
-                asset_ids=list(
-                    (
-                        retrieval_request.filters.asset_ids
-                        if hasattr(retrieval_request, "filters")
-                        else retrieval_request["filters"]["asset_ids"]
-                    )
-                ),
-                domains=list(
-                    (
-                        retrieval_request.filters.domains
-                        if hasattr(retrieval_request, "filters")
-                        else retrieval_request["filters"]["domains"]
-                    )
-                ),
-            ),
-        )
     return DocumentRequest(
         system_id=payload.system_id,
         user_role=payload.user_role,
@@ -107,7 +57,7 @@ def _to_domain_request(payload: DocumentCreateRequest) -> DocumentRequest:
         output_format="markdown",
         topic=payload.topic or payload.scope,
         section_order=payload.section_order,
-        retrieval_request=req_obj,
+        retrieval_request=None,  # populated per-section during generate_section
         metadata={
             "filters": payload.model_dump().get("filters", {}),
             "top_k_chunks": payload.top_k_chunks,
