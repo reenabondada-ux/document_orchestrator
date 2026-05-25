@@ -1,0 +1,18 @@
+{
+  "system_id": "ACME_MAINFRAME_POC",
+  "document_title": "ACME Mainframe System Appreciation Document",
+  "document_type": "system_appreciation",
+  "user_role": "analyst",
+  "topic": "billing, payments, and control/reconciliation batch flows",
+  "scope": "mainframe batch estate",
+  "top_k_chunks": 8,
+  "top_k_paths": 5,
+  "filters": {
+    "asset_types": ["JCL", "PROC", "COBOL", "COPYBOOK", "PARM"],
+    "asset_ids": [],
+    "domains": ["billing", "payments", "controls"]
+  },
+  "metadata": {
+    "document_owner": "platform-modernization"
+  }
+}

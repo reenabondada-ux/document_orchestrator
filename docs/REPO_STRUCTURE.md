@@ -1,0 +1,28 @@
+# Repository Structure
+
+- `mainframe_doc_orchestrator/models.py`
+  - domain objects for requests, plans, evidence packs, and drafts
+- `mainframe_doc_orchestrator/contracts.py`
+  - Protocol definitions for retrieval, planning, generation, validation, and assembly
+- `mainframe_doc_orchestrator/clients/retrieval_client.py`
+  - HTTP client for the RAG evidence-pack API
+- `mainframe_doc_orchestrator/clients/llm_clients.py`
+  - local / hosted / Bedrock model adapters
+- `mainframe_doc_orchestrator/prompt_library.py`
+  - section prompt templates
+- `mainframe_doc_orchestrator/planner.py`
+  - turns a request into section blueprints
+- `mainframe_doc_orchestrator/validator.py`
+  - evidence validation and gap detection
+- `mainframe_doc_orchestrator/assembler.py`
+  - markdown assembly
+- `mainframe_doc_orchestrator/orchestrator.py`
+  - end-to-end document generation workflow
+- `mainframe_doc_orchestrator/cli.py`
+  - local execution entry point
+- `schemas/`
+  - JSON schemas for orchestrator artifacts
+- `templates/`
+  - system appreciation document template
+- `docs/`
+  - build order and design notes

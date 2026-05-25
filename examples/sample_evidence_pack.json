@@ -1,0 +1,75 @@
+{
+  "request_id": "7d0d39f8-8cf3-4d1c-b6f4-0efb16a1a001",
+  "question": "Explain the billing batch flow for ACME_MAINFRAME_POC",
+  "section_name": "batch_flow_overview",
+  "system_id": "ACME_MAINFRAME_POC",
+  "confidence": 0.96,
+  "supporting_chunks": [
+    "BILLRUN1#JCL#JOB",
+    "ABPBLD1#PROC#MAIN",
+    "BLD001#COBOL#MAIN",
+    "BLD001#COBOL#PROCESS-CUSTOMER",
+    "BLD001#COBOL#CALC-BILL",
+    "CUSTH01#COPYBOOK",
+    "TRNID01#COPYBOOK",
+    "BILLRUL#COPYBOOK",
+    "BLDPARM#PARM"
+  ],
+  "chunk_contents": {
+    "BILLRUN1#JCL#JOB": {
+      "chunk_id": "BILLRUN1#JCL#JOB",
+      "asset_id": "JCL__BILLRUN1",
+      "asset_type": "JCL",
+      "chunk_kind": "JOB",
+      "chunk_name": "BILLRUN1",
+      "text": "//BILLRUN1 JOB (ACCT),'MONTHLY BILL',...\n//STEP010  EXEC ABPBLD1,ENV='PROD'\n//STEP020  EXEC PGM=IEBGENER,...",
+      "source_file": "jcl/BILLRUN1.jcl",
+      "line_start": 1,
+      "line_end": 15
+    },
+    "BLD001#COBOL#CALC-BILL": {
+      "chunk_id": "BLD001#COBOL#CALC-BILL",
+      "asset_id": "COBOL__BLD001",
+      "asset_type": "COBOL",
+      "chunk_kind": "PARAGRAPH",
+      "chunk_name": "CALC-BILL",
+      "text": "CALC-BILL.\n    COMPUTE BILL-AMT = BASE-AMT * RATE.",
+      "source_file": "cobol/BLD001.cbl",
+      "line_start": 40,
+      "line_end": 55
+    }
+  },
+  "graph_paths": [
+    {
+      "path_id": "PATH-BILLRUN1-STEP010-ABPBLD1-BLD001",
+      "path_label": "BILLRUN1 → STEP010 → ABPBLD1 → BLD001 → CUSTH01",
+      "nodes": [
+        {"node_id": "BILLRUN1", "node_type": "JOB", "properties": {"source_file": "jcl/BILLRUN1.jcl"}},
+        {"node_id": "STEP010",  "node_type": "STEP", "properties": {}},
+        {"node_id": "ABPBLD1",  "node_type": "PROC", "properties": {"source_file": "proc/ABPBLD1.proc"}},
+        {"node_id": "BLD001",   "node_type": "PROGRAM", "properties": {"source_file": "cobol/BLD001.cbl"}},
+        {"node_id": "CUSTH01",  "node_type": "COPYBOOK", "properties": {"source_file": "copylib/CUSTH01.cpy"}}
+      ],
+      "edges": [
+        {"source_id": "BILLRUN1", "target_id": "STEP010", "edge_type": "HAS_STEP",          "properties": {}},
+        {"source_id": "STEP010",  "target_id": "ABPBLD1", "edge_type": "USES_PROC",          "properties": {}},
+        {"source_id": "ABPBLD1",  "target_id": "BLD001",  "edge_type": "EXECUTES_PROGRAM",   "properties": {}},
+        {"source_id": "BLD001",   "target_id": "CUSTH01", "edge_type": "USES_COPYBOOK",      "properties": {}}
+      ],
+      "supporting_chunks": ["BILLRUN1#JCL#JOB", "BLD001#COBOL#MAIN", "CUSTH01#COPYBOOK"]
+    }
+  ],
+  "supporting_data": {
+    "jobs":      ["JCL__BILLRUN1"],
+    "procs":     ["PROC__ABPBLD1"],
+    "programs":  ["COBOL__BLD001"],
+    "copybooks": ["COPYLIB__CUSTH01", "COPYLIB__TRNID01", "COPYLIB__BILLRUL"],
+    "parms":     ["PARM__BLDPARM"]
+  },
+  "evidence_items": [
+    {"item_type": "chunk",      "ref": "BILLRUN1#JCL#JOB",         "relevance": "entry job stream"},
+    {"item_type": "chunk",      "ref": "BLD001#COBOL#CALC-BILL",   "relevance": "billing rule implementation"},
+    {"item_type": "graph_path", "ref": "PATH-BILLRUN1-STEP010-ABPBLD1-BLD001", "relevance": "full lineage"}
+  ]
+}
+
