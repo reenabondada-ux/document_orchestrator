@@ -29,6 +29,7 @@ from mainframe_doc_orchestrator.api.schemas import (
 from mainframe_doc_orchestrator.models import (
     DocumentRequest,
 )
+from mainframe_doc_orchestrator.planner import DOCUMENT_TYPE_SECTIONS
 from mainframe_doc_orchestrator.services.previewer import (
     render_dashboard_html,
     render_preview_html,
@@ -39,11 +40,6 @@ router = APIRouter(prefix="/documents", tags=["documents"])
 
 
 def _to_domain_request(payload: DocumentCreateRequest) -> DocumentRequest:
-    # Resolve effective top_k_paths: explicit value wins; otherwise derive from
-    # complexity hint.  The resolved values are stored in metadata so that
-    # _build_retrieval_request in workflow_engine can use them per-section.
-    # No RetrievalRequest is constructed here — POST /documents only creates a plan;
-    # retrieval happens later, once per section, inside generate_section.
     effective_top_k_paths = (
         payload.top_k_paths
         if payload.top_k_paths is not None
@@ -53,10 +49,10 @@ def _to_domain_request(payload: DocumentCreateRequest) -> DocumentRequest:
     return DocumentRequest(
         system_id=payload.system_id,
         user_role=payload.user_role,
-        document_style=payload.document_type,
+        document_type=payload.document_type,
         output_format="markdown",
-        topic=payload.topic or payload.scope,
-        section_order=payload.section_order,
+        topic=payload.topic,
+        section_order=DOCUMENT_TYPE_SECTIONS[payload.document_type],
         retrieval_request=None,  # populated per-section during generate_section
         metadata={
             "filters": payload.model_dump().get("filters", {}),
@@ -73,9 +69,7 @@ async def create_document(
     workflow: Annotated[DocumentWorkflowEngine, Depends(get_workflow)],
 ) -> DocumentRunResponse:
     domain_request = _to_domain_request(payload)
-    run = await workflow.create_document_run(
-        domain_request, document_title=payload.document_title
-    )
+    run = await workflow.create_document_run(domain_request)
     return DocumentRunResponse.model_validate(run)
 
 

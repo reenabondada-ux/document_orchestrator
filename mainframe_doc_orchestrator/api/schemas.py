@@ -5,10 +5,6 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
-# Maps caller-supplied JCL complexity hint to a recommended top_k_paths value.
-# simple  — 1-2 steps, 1 program each, few copybooks  (~9 leaf paths)
-# medium  — 3-5 steps, 1-2 programs, moderate copybooks (~15 leaf paths)
-# complex — 5+ steps, multiple programs, many copybooks (~25 leaf paths)
 JCL_COMPLEXITY_TOP_K: dict[str, int] = {
     "simple": 9,
     "medium": 15,
@@ -33,17 +29,11 @@ class RetrievalRequestModel(BaseModel):
 
 class DocumentCreateRequest(BaseModel):
     system_id: str
-    document_title: str | None = None
-    document_type: str = "system_appreciation"
+    document_type: Literal["system_appreciation", "jcl_analysis"] = "system_appreciation"
     user_role: str = "analyst"
     topic: str = ""
-    scope: str = ""
-    section_order: list[str] = Field(default_factory=list)
     top_k_chunks: int = 8
-    # Explicit override — takes precedence over jcl_complexity when provided.
     top_k_paths: int | None = None
-    # Convenience hint: drives top_k_paths when top_k_paths is not explicitly set.
-    # simple=9, medium=15 (default), complex=25
     jcl_complexity: Literal["simple", "medium", "complex"] = "medium"
     filters: RetrievalFiltersModel = Field(default_factory=RetrievalFiltersModel)
     metadata: dict[str, Any] = Field(default_factory=dict)

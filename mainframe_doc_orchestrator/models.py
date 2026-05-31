@@ -74,6 +74,12 @@ class EvidencePack:
 
 @dataclass(slots=True)
 class DocumentSection:
+    """Section plan + execution state.
+    
+    Contains both immutable plan fields (section_id, title, objective, etc.)
+    and mutable runtime fields (status, draft_markdown, confidence, etc.).
+    """
+    # ========== Plan fields (immutable after creation) ==========
     section_id: str
     section_name: str
     title: str
@@ -88,9 +94,27 @@ class DocumentSection:
     # Empty list = no filter (retrieve across all types).
     asset_type_filter: list[str] = field(default_factory=list)
     # Section names that must be review_ready/approved before this section
-    # can be generated.  Used for synthesis sections (application_overview,
-    # executive_summary) that consume prior draft text rather than raw retrieval.
+    # can be generated.  Used for synthesis sections and cascade sections.
     depends_on: list[str] = field(default_factory=list)
+    # jcl_analysis cascading: harvest asset IDs from these upstream sections
+    # to scope this section's retrieval via RetrievalFilters.asset_ids.
+    cascade_from: list[str] = field(default_factory=list)
+    # Node types to extract from this section's evidence pack graph paths
+    # and store as discovered_asset_ids for downstream cascade sections.
+    cascade_node_types: list[str] = field(default_factory=list)
+    
+    # ========== Runtime fields (populated during execution) ==========
+    status: str = "pending"  # pending | in_progress | review_ready | approved
+    draft_markdown: str = ""
+    evidence_request_id: str | None = None
+    confidence: float = 0.0
+    notes: list[str] = field(default_factory=list)
+    retrieval_pass_id: str | None = None
+    retrieval_pass_number: int | None = None
+    discovered_asset_ids: dict[str, list[str]] = field(default_factory=dict)
+    evidence_overview: str = ""
+    updated_at: str = ""
+    approval_notes: list[str] = field(default_factory=list)
 
 @dataclass(slots=True)
 class SectionDraft:
@@ -115,7 +139,7 @@ class DocumentRequest:
     run_id: str = field(default_factory=lambda: str(uuid4()))
     system_id: str = ""
     user_role: str = ""
-    document_style: str = "system_appreciation"
+    document_type: str = "system_appreciation"
     output_format: str = "markdown"
     topic: str = ""
     section_order: list[str] = field(default_factory=list)

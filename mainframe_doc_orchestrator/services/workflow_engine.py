@@ -6,7 +6,6 @@ calls are never made synchronously; the event loop is never blocked.
 
 from __future__ import annotations
 
-from dataclasses import asdict
 from datetime import datetime, timezone
 from typing import Any
 
@@ -20,10 +19,20 @@ from mainframe_doc_orchestrator.models import (
     RetrievalRequest,
     SectionDraft,
 )
-from mainframe_doc_orchestrator.planner import MainframeDocumentPlanner
+from mainframe_doc_orchestrator.planner import (
+    DOCUMENT_TYPE_LABELS,
+    MainframeDocumentPlanner,
+)
 from mainframe_doc_orchestrator.validator import MainframeEvidenceValidator
 from mainframe_doc_orchestrator.services.draft_writer import SectionDraftWriter
 from mainframe_doc_orchestrator.services.exporter import DocumentExporter
+from mainframe_doc_orchestrator.serialization import (
+    sections_map_to_stored_sections_list,
+    stored_sections_list_to_sections_map,
+)
+
+
+SUMMARY_PREVIEW_LIMIT = 5
 
 
 class DocumentWorkflowEngine:
@@ -50,19 +59,14 @@ class DocumentWorkflowEngine:
             llm_client=llm_client,
         )
 
-    async def create_document_run(
-        self, request: DocumentRequest, document_title: str | None = None
-    ) -> dict[str, Any]:
+    async def create_document_run(self, request: DocumentRequest) -> dict[str, Any]:
         plan = self.planner.plan(request)
-        plan_state = self._plan_to_state(
-            plan=plan, request=request, document_title=document_title
-        )
+        plan_dict = self._plan_to_dict(plan=plan, request=request)
         run = await self.document_repository.create_run(
             run_id=request.run_id,
-            document_title=document_title
-            or f"System Appreciation Document - {request.system_id}",
+            document_title=plan_dict["document_title"],
             system_id=request.system_id,
-            plan=plan_state,
+            plan=plan_dict,
             status="created",
         )
         return run
@@ -71,51 +75,46 @@ class DocumentWorkflowEngine:
         self, run_id: str, section_name: str | None = None
     ) -> dict[str, Any]:
         run = await self.document_repository.get_run(run_id)
-        plan = run["plan"]
-        request = self._document_request_from_plan(plan, run_id)
-        sections = plan.get("sections", [])
-        section_state = self._select_section_state(sections, section_name)
-        if section_state is None:
-            raise ValueError("No matching section available for generation.")
+        plan_dict = run["plan"]
+        request = self._document_request_from_plan(plan_dict, run_id)
+        sections = stored_sections_list_to_sections_map(plan_dict.get("sections", []))
 
-        document_section = self._document_section_from_state(section_state)
+        section = self._select_section(sections, section_name)
+        if section is None:
+            raise ValueError("No matching section available for generation.")
 
         # Dependency guard: Phase 2 sections require all depends_on sections to be
         # review_ready or approved before generation can proceed.
-        if document_section.depends_on:
+        if section.depends_on:
             not_ready = [
                 dep
-                for dep in document_section.depends_on
-                if self._get_section_state(plan, dep).get("status")
-                not in {"review_ready", "approved"}
+                for dep in section.depends_on
+                if sections[dep].status not in {"review_ready", "approved"}
             ]
             if not_ready:
                 raise ValueError(
-                    f"Section '{document_section.section_name}' depends on sections that "
+                    f"Section '{section.section_name}' depends on sections that "
                     f"are not yet review_ready or approved: {not_ready}"
                 )
 
         # Collect prior drafts for synthesis sections.
         prior_drafts: dict[str, str] | None = None
-        if document_section.depends_on:
+        if section.depends_on:
             prior_drafts = {
-                dep: self._get_section_state(plan, dep).get("draft_markdown", "")
-                for dep in document_section.depends_on
+                dep: sections[dep].draft_markdown for dep in section.depends_on
             }
 
         prior_pass_count = await self.retrieval_pass_repository.next_pass_number(
-            run_id, document_section.section_name
+            run_id, section.section_name
         )
-        retrieval_request = self._build_retrieval_request(
-            request, document_section, plan
-        )
+        retrieval_request = self._build_retrieval_request(section, sections, plan_dict)
 
         # Crash-recovery: if a completed pass already exists with an
         # evidence_request_id, the previous run completed retrieval but
         # crashed before finishing draft writing.  Re-fetch the pack via
         # GET /v1/evidence-packs/{id} instead of triggering a new retrieval.
         existing_pass = await self.retrieval_pass_repository.get_latest_completed_pass(
-            run_id, document_section.section_name
+            run_id, section.section_name
         )
         if existing_pass and existing_pass.get("evidence_request_id"):
             retrieval_pass = existing_pass
@@ -125,7 +124,7 @@ class DocumentWorkflowEngine:
         else:
             retrieval_pass = await self.retrieval_pass_repository.create_pass(
                 run_id=run_id,
-                section_name=document_section.section_name,
+                section_name=section.section_name,
                 pass_number=prior_pass_count,
                 query=retrieval_request.query,
                 evidence_request_id=None,
@@ -141,41 +140,48 @@ class DocumentWorkflowEngine:
         answer_summary = self._summarize_evidence_pack(evidence_pack)
         section_markdown = await self.draft_writer.write(
             request=request,
-            section=document_section,
+            section=section,
             evidence_pack=evidence_pack,
             prior_pass_count=prior_pass_count - 1,
             prior_drafts=prior_drafts,
         )
         notes = self.validator.validate_section(section_markdown, evidence_pack)
-        section_state.update(
-            {
-                "status": "review_ready",
-                "draft_markdown": section_markdown,
-                "evidence_request_id": evidence_pack.evidence_request_id,
-                "confidence": evidence_pack.confidence,
-                "notes": notes,
-                "retrieval_pass_id": retrieval_pass["pass_id"],
-                "retrieval_pass_number": prior_pass_count,
-                "evidence_overview": answer_summary,
-                "updated_at": self._now_iso(),
-            }
+
+        # Update section with results
+        section.status = "review_ready"
+        section.draft_markdown = section_markdown
+        section.evidence_request_id = evidence_pack.evidence_request_id
+        section.confidence = evidence_pack.confidence
+        section.notes = notes
+        section.retrieval_pass_id = retrieval_pass["pass_id"]
+        section.retrieval_pass_number = prior_pass_count
+        section.evidence_overview = answer_summary
+        section.discovered_asset_ids = self._harvest_asset_ids(
+            evidence_pack, section.cascade_node_types
         )
+        section.updated_at = self._now_iso()
+
+        # Persist updated plan
+        plan_dict["sections"] = sections_map_to_stored_sections_list(sections)
         run_status = self._derive_run_status(sections)
-        await self.document_repository.update_run(run_id, plan=plan, status=run_status)
-        return await self.get_section(run_id, document_section.section_name)
+        await self.document_repository.update_run(
+            run_id, plan=plan_dict, status=run_status
+        )
+        return await self.get_section(run_id, section.section_name)
 
     async def regenerate_section(
         self, run_id: str, section_name: str
     ) -> dict[str, Any]:
         run = await self.document_repository.get_run(run_id)
-        plan = run["plan"]
-        section_state = self._get_section_state(plan, section_name)
-        section_state["status"] = "pending"
-        section_state["updated_at"] = self._now_iso()
+        plan_dict = run["plan"]
+        sections = stored_sections_list_to_sections_map(plan_dict.get("sections", []))
+        sections[section_name].status = "pending"
+        sections[section_name].updated_at = self._now_iso()
+        plan_dict["sections"] = sections_map_to_stored_sections_list(sections)
         await self.document_repository.update_run(
             run_id,
-            plan=plan,
-            status=self._derive_run_status(plan.get("sections", [])),
+            plan=plan_dict,
+            status=self._derive_run_status(sections),
         )
         return await self.generate_section(run_id, section_name)
 
@@ -193,27 +199,30 @@ class DocumentWorkflowEngine:
 
     async def generate_next_pending_section(self, run_id: str) -> dict[str, Any]:
         run = await self.document_repository.get_run(run_id)
-        sections = run["plan"].get("sections", [])
-        next_section = next((s for s in sections if s.get("status") == "pending"), None)
+        plan_dict = run["plan"]
+        sections = stored_sections_list_to_sections_map(plan_dict.get("sections", []))
+        next_section = next(
+            (s for s in sections.values() if s.status == "pending"), None
+        )
         if next_section is None:
             raise ValueError("No pending sections left to generate.")
-        return await self.generate_section(run_id, next_section["section_name"])
+        return await self.generate_section(run_id, next_section.section_name)
 
     async def approve_section(
         self, run_id: str, section_name: str, notes: str | None = None
     ) -> dict[str, Any]:
         run = await self.document_repository.get_run(run_id)
-        plan = run["plan"]
-        section_state = self._get_section_state(plan, section_name)
-        section_state["status"] = "approved"
+        plan_dict = run["plan"]
+        sections = stored_sections_list_to_sections_map(plan_dict.get("sections", []))
+        sections[section_name].status = "approved"
         if notes:
-            section_state.setdefault("approval_notes", [])
-            section_state["approval_notes"].append(notes)
-        section_state["updated_at"] = self._now_iso()
+            sections[section_name].approval_notes.append(notes)
+        sections[section_name].updated_at = self._now_iso()
+        plan_dict["sections"] = sections_map_to_stored_sections_list(sections)
         await self.document_repository.update_run(
             run_id,
-            plan=plan,
-            status=self._derive_run_status(plan.get("sections", [])),
+            plan=plan_dict,
+            status=self._derive_run_status(sections),
         )
         return await self.get_section(run_id, section_name)
 
@@ -269,144 +278,133 @@ class DocumentWorkflowEngine:
     # Private helpers — all pure / synchronous
     # ------------------------------------------------------------------
 
-    def _plan_to_state(
+    def _plan_to_dict(
         self,
         *,
         plan: DocumentPlan,
         request: DocumentRequest,
-        document_title: str | None,
     ) -> dict[str, Any]:
-        plan_dict = asdict(plan)
-        plan_dict["document_title"] = (
-            document_title or f"System Appreciation Document - {request.system_id}"
+        """Convert DocumentPlan to dict for JSON storage."""
+        label = DOCUMENT_TYPE_LABELS.get(
+            request.document_type,
+            request.document_type.replace("_", " ").title(),
         )
-        plan_dict["document_style"] = request.document_style
-        plan_dict["user_role"] = request.user_role
-        plan_dict["topic"] = request.topic
-        plan_dict["section_order"] = request.section_order
-        plan_dict["metadata"] = {**plan_dict.get("metadata", {}), **request.metadata}
-        for section in plan_dict["sections"]:
-            section.setdefault("status", "pending")
-            section.setdefault("draft_markdown", "")
-            section.setdefault("confidence", 0.0)
-            section.setdefault("notes", [])
-            section.setdefault("evidence_request_id", None)
-            section.setdefault("retrieval_pass_id", None)
-            section.setdefault("retrieval_pass_number", None)
-            section.setdefault("updated_at", self._now_iso())
-            section.setdefault("asset_type_filter", [])
-            section.setdefault("depends_on", [])
-        return plan_dict
+        # Serialize sections to a list for JSON storage
+        sections_list = sections_map_to_stored_sections_list(
+            {s.section_name: s for s in plan.sections}
+        )
+        return {
+            "plan_id": plan.plan_id,
+            "system_id": plan.system_id,
+            "run_id": plan.run_id,
+            "document_title": f"{request.system_id} — {label}",
+            "document_type": request.document_type,
+            "user_role": request.user_role,
+            "topic": request.topic,
+            "section_order": request.section_order,
+            "sections": sections_list,
+            "metadata": {**plan.metadata, **request.metadata},
+        }
 
     def _document_request_from_plan(
         self, plan: dict[str, Any], run_id: str
     ) -> DocumentRequest:
-        filters_data = plan.get("metadata", {}).get("filters", {})
-        retrieval_request_data = plan.get("metadata", {}).get("retrieval_request")
-        retrieval_request = None
-        if retrieval_request_data:
-            retrieval_request = RetrievalRequest(
-                query=retrieval_request_data.get("query", plan.get("topic", "")),
-                section_name=retrieval_request_data.get(
-                    "section_name", "batch_flow_overview"
-                ),
-                system_id=plan["system_id"],
-                top_k_chunks=int(retrieval_request_data.get("top_k_chunks", 8)),
-                top_k_paths=int(retrieval_request_data.get("top_k_paths", 5)),
-                filters=RetrievalFilters(
-                    asset_types=list(filters_data.get("asset_types", [])),
-                    asset_ids=list(filters_data.get("asset_ids", [])),
-                    domains=list(filters_data.get("domains", [])),
-                ),
-            )
         return DocumentRequest(
             run_id=run_id,
             system_id=plan["system_id"],
             user_role=plan.get("user_role", "analyst"),
-            document_style=plan.get("document_style", "system_appreciation"),
+            document_type=plan.get("document_type", "system_appreciation"),
             output_format=plan.get("metadata", {}).get("output_format", "markdown"),
             topic=plan.get("topic", ""),
             section_order=list(plan.get("section_order", [])),
             prior_run_ids=list(plan.get("metadata", {}).get("prior_run_ids", [])),
-            retrieval_request=retrieval_request,
+            retrieval_request=None,
             metadata=plan.get("metadata", {}),
         )
 
     def _build_retrieval_request(
-        self, request: DocumentRequest, section: DocumentSection, plan: dict[str, Any]
+        self,
+        section: DocumentSection,
+        sections: dict[str, DocumentSection],
+        plan_dict: dict[str, Any],
     ) -> RetrievalRequest:
-        metadata = plan.get("metadata", {})
-        existing = request.retrieval_request
-        if existing and existing.section_name == section.section_name:
-            return existing
-        filters_data = metadata.get("filters", {})
-        # Section-level asset_type_filter takes precedence over plan-level filters.
+        metadata = plan_dict.get("metadata", {})
+        initial_request_filters = metadata.get("filters", {})
+        # Section-level asset_type_filter takes precedence over plan-level filters that holds initial request values.
         asset_types = (
             list(section.asset_type_filter)
             if section.asset_type_filter
-            else list(filters_data.get("asset_types", []))
+            else list(initial_request_filters.get("asset_types", []))
         )
+        # Cascade: collect asset IDs discovered by upstream sections.
+        cascaded_asset_ids: list[str] = []
+        if section.cascade_from:
+            for upstream_name in section.cascade_from:
+                upstream_section = sections.get(upstream_name)
+                if upstream_section is not None:
+                    for asset_ids in upstream_section.discovered_asset_ids.values():
+                        cascaded_asset_ids.extend(asset_ids)
         filters = RetrievalFilters(
             asset_types=asset_types,
-            asset_ids=list(filters_data.get("asset_ids", [])),
-            domains=list(filters_data.get("domains", [])),
+            asset_ids=cascaded_asset_ids
+            or list(initial_request_filters.get("asset_ids", [])),
+            domains=list(initial_request_filters.get("domains", [])),
         )
-        query = request.topic or plan.get("document_title", request.system_id)
+        system_id = plan_dict["system_id"]
+        query = plan_dict.get("topic", "") or plan_dict.get("document_title", system_id)
         query = (
             f"{query}. Section focus: {section.title}. {section.retrieval_hint}".strip()
         )
         return RetrievalRequest(
             query=query,
             section_name=section.section_name,
-            system_id=request.system_id,
+            system_id=system_id,
             top_k_chunks=int(metadata.get("top_k_chunks", 8)),
             top_k_paths=int(metadata.get("top_k_paths", 15)),
             filters=filters,
         )
 
     @staticmethod
-    def _select_section_state(
-        sections: list[dict[str, Any]], section_name: str | None
-    ) -> dict[str, Any] | None:
+    def _select_section(
+        sections: dict[str, DocumentSection], section_name: str | None
+    ) -> DocumentSection | None:
+        """Select section by name, or first pending section if no name given."""
         if section_name:
-            return next(
-                (s for s in sections if s.get("section_name") == section_name), None
-            )
-        return next((s for s in sections if s.get("status") == "pending"), None)
+            return sections.get(section_name)
+        return next((s for s in sections.values() if s.status == "pending"), None)
 
     @staticmethod
-    def _document_section_from_state(section_state: dict[str, Any]) -> DocumentSection:
-        return DocumentSection(
-            section_id=section_state["section_id"],
-            section_name=section_state["section_name"],
-            title=section_state["title"],
-            objective=section_state.get("objective", ""),
-            prompt_key=section_state.get("prompt_key", section_state["section_name"]),
-            required_evidence=list(section_state.get("required_evidence", [])),
-            retrieval_hint=section_state.get("retrieval_hint", ""),
-            min_chunks=int(section_state.get("min_chunks", 1)),
-            min_paths=int(section_state.get("min_paths", 0)),
-            asset_type_filter=list(section_state.get("asset_type_filter", [])),
-            depends_on=list(section_state.get("depends_on", [])),
+    def _summarize_evidence_pack(evidence_pack: EvidencePack) -> str:
+        chunk_ids = ", ".join(evidence_pack.supporting_chunks[:SUMMARY_PREVIEW_LIMIT])
+        path_ids = ", ".join(
+            path.path_id for path in evidence_pack.graph_paths[:SUMMARY_PREVIEW_LIMIT]
+        )
+        return (
+            f"Retrieved {len(evidence_pack.supporting_chunks)} chunks and "
+            f"{len(evidence_pack.graph_paths)} graph paths. "
+            f"Key chunks: {chunk_ids}. Key paths: {path_ids}."
         )
 
     @staticmethod
-    def _get_section_state(plan: dict[str, Any], section_name: str) -> dict[str, Any]:
-        section = next(
-            (
-                s
-                for s in plan.get("sections", [])
-                if s.get("section_name") == section_name
-            ),
-            None,
-        )
-        if section is None:
-            raise KeyError(f"Section not found: {section_name}")
-        return section
+    def _harvest_asset_ids(
+        evidence_pack: EvidencePack, node_types: list[str]
+    ) -> dict[str, list[str]]:
+        """Extract unique node IDs by type from graph paths for cascade retrieval."""
+        if not node_types:
+            return {}
+        discovered: dict[str, list[str]] = {}
+        for path in evidence_pack.graph_paths:
+            for node in path.nodes:
+                if node.node_type in node_types:
+                    bucket = discovered.setdefault(node.node_type, [])
+                    if node.node_id not in bucket:
+                        bucket.append(node.node_id)
+        return discovered
 
     @staticmethod
-    def _derive_run_status(sections: list[dict[str, Any]]) -> str:
-        statuses = [str(section.get("status", "pending")) for section in sections]
+    def _derive_run_status(sections: dict[str, DocumentSection]) -> str:
+        """Derive overall run status from section statuses."""
+        statuses = [s.status for s in sections.values()]
         if all(status == "approved" for status in statuses) and statuses:
             return "approved"
         if any(status == "review_ready" for status in statuses):
@@ -416,42 +414,34 @@ class DocumentWorkflowEngine:
         return "created"
 
     def _draft_from_plan(self, run: dict[str, Any]) -> DocumentDraft:
-        plan = run["plan"]
-        sections = []
-        for section in plan.get("sections", []):
-            if section.get("draft_markdown"):
-                sections.append(
+        """Build DocumentDraft from run state."""
+        plan_dict = run["plan"]
+        sections = stored_sections_list_to_sections_map(plan_dict.get("sections", []))
+        section_drafts = []
+        for section in sections.values():
+            if section.draft_markdown:
+                section_drafts.append(
                     SectionDraft(
-                        section_id=section["section_id"],
-                        section_name=section["section_name"],
-                        title=section["title"],
-                        content_markdown=section.get("draft_markdown", ""),
-                        evidence_request_id=section.get("evidence_request_id") or "",
-                        confidence=float(section.get("confidence", 0.0)),
-                        notes=list(section.get("notes", [])),
+                        section_id=section.section_id,
+                        section_name=section.section_name,
+                        title=section.title,
+                        content_markdown=section.draft_markdown,
+                        evidence_request_id=section.evidence_request_id or "",
+                        confidence=section.confidence,
+                        notes=list(section.notes),
                     )
                 )
         draft = DocumentDraft(
             run_id=run["run_id"],
             system_id=run["system_id"],
             title=run["document_title"],
-            sections=sections,
+            sections=section_drafts,
             rendered_markdown="",
             confidence=0.0,
-            metadata={"plan": plan, "run_status": run["status"]},
+            metadata={"plan": plan_dict, "run_status": run["status"]},
         )
         draft.rendered_markdown = self.exporter.export_markdown(draft)
         return draft
-
-    @staticmethod
-    def _summarize_evidence_pack(evidence_pack: EvidencePack) -> str:
-        chunk_ids = ", ".join(evidence_pack.supporting_chunks[:5])
-        path_ids = ", ".join(path.path_id for path in evidence_pack.graph_paths[:5])
-        return (
-            f"Retrieved {len(evidence_pack.supporting_chunks)} chunks and "
-            f"{len(evidence_pack.graph_paths)} graph paths. "
-            f"Key chunks: {chunk_ids}. Key paths: {path_ids}."
-        )
 
     @staticmethod
     def _now_iso() -> str:

@@ -143,7 +143,7 @@ depend on Phase 1 drafts being approved first.
 > automatically — you do not need to specify the section name. Call it in a loop
 > until `GET /documents/{run_id}` shows `status: complete`.
 
-### Example payload — POST /documents
+### Example payload to generate system appreciation document — POST /documents
 
 ```json
 {
@@ -163,6 +163,23 @@ depend on Phase 1 drafts being approved first.
     "output_format": "markdown",
     "prior_run_ids": [],
     "source_bundle": "mainframe_poc_bundle"
+  }
+}
+```
+
+### Example payload to generate a JCL analysis document - POST /documents
+
+``` json
+{
+  "system_id": "JCL_ANALYSIS_BILLRUN1",
+  "document_type": "jcl_analysis",
+  "user_role": "analyst",
+  "topic": "Analyse billing flow in BILLRUN1 JCL",
+  "jcl_complexity": "medium",
+  "top_k_chunks": 10,
+  "filters": {
+    "asset_types": ["JCL", "PROC", "COBOL", "COPYBOOK", "PARM"],
+    "asset_ids": ["JCL__BILLRUN1"]
   }
 }
 ```

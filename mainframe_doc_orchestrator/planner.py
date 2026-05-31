@@ -1,24 +1,47 @@
 from __future__ import annotations
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from uuid import uuid4
 from mainframe_doc_orchestrator.models import (
     DocumentPlan,
     DocumentRequest,
     DocumentSection,
-    EvidencePack,
 )
 
 # Phase 1 sections in generation order, Phase 2 synthesis sections last.
 DEFAULT_SECTION_ORDER: list[str] = [
-    "jcl_and_procs",
-    "cobol_programs",
-    "copybooks_and_data_structures",
-    "operational_behavior",
-    "dependencies_and_integrations",
-    "gaps_and_assumptions",
-    "application_overview",
-    "executive_summary",
+    "jcl_and_procs",  # Phase 1
+    "cobol_programs",  # Phase 1
+    "copybooks_and_data_structures",  # Phase 1
+    "operational_behavior",  # Phase 1
+    "dependencies_and_integrations",  # Phase 1
+    "gaps_and_assumptions",  # Phase 1
+    "application_overview",  # Phase 2 synthesis
+    "executive_summary",  # Phase 2 synthesis
 ]
+
+# Registry: document_type → ordered list of section names to generate.
+# This is the single source of truth that drives section planning.
+DOCUMENT_TYPE_SECTIONS: dict[str, list[str]] = {
+    "system_appreciation": list(DEFAULT_SECTION_ORDER),
+    "jcl_analysis": [
+        "jcl_analysis_jcl",           # Phase 1 — seed: retrieves JCL chunks
+        "jcl_analysis_procs",          # Phase 1 — cascaded from JCL
+        "jcl_analysis_cobol",          # Phase 1 — cascaded from JCL + PROCs
+        "jcl_analysis_copybooks",      # Phase 1 — cascaded from COBOL
+        "jcl_analysis_operational_behavior",          # Phase 1 — cross-cutting: JCL/PROC/PARM
+        "jcl_analysis_dependencies_and_integrations", # Phase 1 — cross-cutting: full lineage
+        "jcl_analysis_gaps_and_assumptions",          # Phase 1 — evidence gaps
+        "jcl_analysis_application_overview",          # Phase 2 — synthesis
+        "jcl_analysis_executive_summary",             # Phase 2 — synthesis
+    ],
+}
+
+# Human-readable labels used to derive document_title automatically.
+DOCUMENT_TYPE_LABELS: dict[str, str] = {
+    "system_appreciation": "System Appreciation",
+    "jcl_analysis": "JCL Analysis",
+}
 
 
 @dataclass(slots=True)
@@ -32,10 +55,13 @@ class SectionBlueprint:
     min_chunks: int = 1
     min_paths: int = 0
     max_tokens: int = 0  # 0 = use global draft_writer_max_tokens
-    # Forwarded to RetrievalFilters.asset_types.  Empty = no filter.
     asset_type_filter: list[str] = field(default_factory=list)
     # Section names that must be review_ready/approved first.
     depends_on: list[str] = field(default_factory=list)
+    # jcl_analysis cascading: harvest asset IDs from these upstream sections.
+    cascade_from: list[str] = field(default_factory=list)
+    # Node types to extract from this section's graph paths for downstream sections.
+    cascade_node_types: list[str] = field(default_factory=list)
 
 
 DEFAULT_BLUEPRINTS: dict[str, SectionBlueprint] = {
@@ -57,9 +83,13 @@ DEFAULT_BLUEPRINTS: dict[str, SectionBlueprint] = {
         required_evidence=["job", "step", "proc", "dataset", "program"],
         retrieval_hint=(
             "Retrieve JCL and PROC chunks. "
-            "Use EXECUTES_PROGRAM and USES_PROC graph edges to identify programs "
-            "executed by each step. "
-            "Use READS_DATASET and WRITES_DATASET edges to list datasets. "
+            "Use HAS_STEP to enumerate JCL steps in order. "
+            "Use USES_PROC to identify PROCs called by each JCL step. "
+            "Use EXECUTES_PROGRAM to identify programs executed directly by JCL steps. "
+            "For PROC-invoked steps, traverse HAS_PROC_STEP and EXECUTES_PROGRAM "
+            "to list programs executed inside each PROC. "
+            "Use READS_DATASET, WRITES_DATASET and READS_OR_WRITES_DATASET to list JCL dataset I/O, "
+            "and use PROC step chunk text for PROC-local DD references. "
             "Do NOT describe COBOL program logic — name programs only."
         ),
         min_chunks=5,
@@ -79,9 +109,10 @@ DEFAULT_BLUEPRINTS: dict[str, SectionBlueprint] = {
         retrieval_hint=(
             "Retrieve COBOL paragraph chunks. "
             "Use USES_COPYBOOK edges to list copybooks consumed by each program. "
-            "Use incoming EXECUTES_PROGRAM / USES_PROC edges to identify which "
-            "job steps invoke each program. "
-            "Use READS_DATASET / WRITES_DATASET edges for file I/O. "
+            "Use READS_DATASET / WRITES_DATASET edges for file I/O and CALLS_PROGRAM "
+            "for inter-program dependencies. "
+            "To identify invokers, trace inbound EXECUTES_PROGRAM edges; when a program is "
+            "invoked through a PROC, follow PROC_STEP <- HAS_PROC_STEP <- PROC <- USES_PROC <- STEP. "
             "Describe business logic from chunk text only — label inferences [INFERRED]. "
             "Do NOT reproduce copybook field layouts here."
         ),
@@ -103,7 +134,8 @@ DEFAULT_BLUEPRINTS: dict[str, SectionBlueprint] = {
             "Retrieve COPYBOOK chunks only. "
             "Use incoming USES_COPYBOOK graph edges to find which COBOL programs "
             "COPY each copybook — list these programs under each copybook entry. "
-            "Only describe fields present verbatim in the chunk text."
+            "Describe record fields from COPYBOOK chunk text/metadata only; "
+            "do not infer fields from COBOL paragraphs."
         ),
         min_chunks=3,
         min_paths=2,
@@ -121,8 +153,10 @@ DEFAULT_BLUEPRINTS: dict[str, SectionBlueprint] = {
         required_evidence=["parm", "checkpoint", "restart", "audit", "error", "cond"],
         retrieval_hint=(
             "Retrieve JCL, PROC, and PARM chunks. "
-            "Focus on COND codes, PARM members, conditional step execution, "
-            "and any restart or recovery paths visible in the JCL."
+            "Extract COND/restart behavior from JCL EXEC bodies and step chunk text, "
+            "and use PROC step chunks for procedure-level control flow. "
+            "For PARM assets, use parsed key_values metadata and raw PARM text to document "
+            "runtime switches, overrides, and error-handling controls."
         ),
         min_chunks=3,
         min_paths=2,
@@ -139,9 +173,10 @@ DEFAULT_BLUEPRINTS: dict[str, SectionBlueprint] = {
         prompt_key="dependencies_and_integrations",
         required_evidence=["dataset", "call", "utility", "external"],
         retrieval_hint=(
-            "Traverse outward from programs and steps to their dataset and "
-            "utility neighbours. Include CALLS_PROGRAM, READS_DATASET, "
-            "WRITES_DATASET, and USES_PROC edges."
+            "Traverse outward from JCL STEP, PROC_STEP, and COBOL PROGRAM nodes. "
+            "Include USES_PROC, EXECUTES_PROGRAM, and CALLS_PROGRAM to map control dependencies. "
+            "Use READS_DATASET / WRITES_DATASET / READS_OR_WRITES_DATASET for dataset integration "
+            "points, and include utility programs named in EXEC targets."
         ),
         min_chunks=4,
         min_paths=3,
@@ -158,8 +193,9 @@ DEFAULT_BLUEPRINTS: dict[str, SectionBlueprint] = {
         prompt_key="gaps_and_assumptions",
         required_evidence=["confidence", "unsupported", "inferred"],
         retrieval_hint=(
-            "Pull low-confidence items and evidence_items flagged as "
-            "structural_required or inferred."
+            "Pull low-confidence items and inferred statements from prior section drafts. "
+            "Flag unresolved identifiers and partial links seen in parsed evidence "
+            "(for example missing EXEC targets, unmapped DD/DSN intent, or ambiguous program/proc names)."
         ),
         min_chunks=2,
         min_paths=0,
@@ -218,6 +254,268 @@ DEFAULT_BLUEPRINTS: dict[str, SectionBlueprint] = {
             "gaps_and_assumptions",
         ],
     ),
+    # ------------------------------------------------------------------
+    # jcl_analysis document type — cascaded retrieval chain:
+    # JCL → (discovers PROCs + COBOLs) → PROCs → (discovers COBOLs) →
+    # COBOL → (discovers COPYBOOKs) → COPYBOOKs
+    # Each section uses asset IDs harvested from upstream graph paths.
+    # ------------------------------------------------------------------
+    "jcl_analysis_jcl": SectionBlueprint(
+        section_name="jcl_analysis_jcl",
+        title="JCL Jobs",
+        objective=(
+            "Document each JCL job: steps in execution order, programs and PROCs "
+            "invoked per step, COND codes, and datasets read or written."
+        ),
+        prompt_key="jcl_analysis_jcl",
+        required_evidence=["job", "step", "dataset"],
+        retrieval_hint=(
+            "Retrieve JCL chunks for this system. "
+            "Use HAS_STEP edges to enumerate step execution order. "
+            "Use EXECUTES_PROGRAM for steps that directly run PGM= targets, and USES_PROC "
+            "for steps that invoke procedures. "
+            "Extract COND/restart behavior from the JCL step text (EXEC body), not inferred logic. "
+            "Use READS_DATASET, WRITES_DATASET and READS_OR_WRITES_DATASET edges for dataset I/O. "
+            "Do NOT describe COBOL logic — name programs and PROCs only."
+        ),
+        min_chunks=3,
+        min_paths=3,
+        max_tokens=3000,
+        asset_type_filter=["JCL"],
+        cascade_node_types=["PROC", "COBOL", "PARM"],
+    ),
+    "jcl_analysis_procs": SectionBlueprint(
+        section_name="jcl_analysis_procs",
+        title="Procedures",
+        objective=(
+            "Document each PROC catalogued by the JCL: steps, programs invoked, "
+            "symbolic parameters, and datasets referenced."
+        ),
+        prompt_key="jcl_analysis_procs",
+        required_evidence=["proc", "step", "program", "dataset"],
+        retrieval_hint=(
+            "Retrieve PROC chunks whose IDs were discovered from the JCL graph. "
+            "Use HAS_PROC_STEP to enumerate procedure steps and EXECUTES_PROGRAM "
+            "to list programs called by each PROC step. "
+            "Use PROC step chunk text to capture symbolic parameters and DD/dataset references "
+            "when no dataset edge is present."
+        ),
+        min_chunks=2,
+        min_paths=2,
+        max_tokens=3000,
+        asset_type_filter=["PROC"],
+        depends_on=["jcl_analysis_jcl"],
+        cascade_from=["jcl_analysis_jcl"],
+        cascade_node_types=["COBOL", "PARM"],
+    ),
+    "jcl_analysis_cobol": SectionBlueprint(
+        section_name="jcl_analysis_cobol",
+        title="COBOL Programs",
+        objective=(
+            "Document each COBOL program executed by the JCL or its PROCs: business "
+            "logic, paragraphs, copybooks used, datasets accessed, and which JCL "
+            "step or PROC invokes it."
+        ),
+        prompt_key="jcl_analysis_cobol",
+        required_evidence=["program", "paragraph", "copybook", "dataset"],
+        retrieval_hint=(
+            "Retrieve COBOL chunks whose IDs were discovered from JCL and PROC graphs. "
+            "Use USES_COPYBOOK edges to list copybooks, READS_DATASET/WRITES_DATASET "
+            "for file I/O, and CALLS_PROGRAM for downstream program calls. "
+            "Reference invokers by tracing inbound EXECUTES_PROGRAM edges directly from JCL steps "
+            "or via PROC_STEP/HAS_PROC_STEP chains."
+        ),
+        min_chunks=4,
+        min_paths=3,
+        max_tokens=5000,
+        asset_type_filter=["COBOL"],
+        depends_on=["jcl_analysis_jcl", "jcl_analysis_procs"],
+        cascade_from=["jcl_analysis_jcl", "jcl_analysis_procs"],
+        cascade_node_types=["COPYBOOK"],
+    ),
+    "jcl_analysis_copybooks": SectionBlueprint(
+        section_name="jcl_analysis_copybooks",
+        title="Copybooks and Data Structures",
+        objective=(
+            "Document each copybook expanded by the COBOL programs in this JCL lineage: "
+            "record layout with PIC clauses in business language, and which programs "
+            "expand it."
+        ),
+        prompt_key="jcl_analysis_copybooks",
+        required_evidence=["copybook", "field", "record"],
+        retrieval_hint=(
+            "Retrieve COPYBOOK chunks whose IDs were discovered from COBOL graphs. "
+            "Use incoming USES_COPYBOOK edges to list which COBOL programs expand each "
+            "copybook. Describe fields from copybook text/metadata only, preserving "
+            "verbatim structure where needed for accuracy."
+        ),
+        min_chunks=2,
+        min_paths=1,
+        max_tokens=3500,
+        asset_type_filter=["COPYBOOK"],
+        depends_on=["jcl_analysis_cobol"],
+        cascade_from=["jcl_analysis_cobol"],
+    ),
+    # ------------------------------------------------------------------
+    # jcl_analysis Phase 1 — cross-cutting sections
+    # These are generated after the four cascaded sections so that all
+    # lineage asset IDs have been discovered and can be used to scope
+    # retrieval via cascade_from.
+    # ------------------------------------------------------------------
+    "jcl_analysis_operational_behavior": SectionBlueprint(
+        section_name="jcl_analysis_operational_behavior",
+        title="Operational Behavior",
+        objective=(
+            "Summarise the operational and run-time behavior of this JCL job and its "
+            "related PROCs and PARM members: COND/restart logic, PARM-driven switches, "
+            "symbolic parameters, error handling, checkpoints, and audit trails."
+        ),
+        prompt_key="jcl_analysis_operational_behavior",
+        required_evidence=["parm", "cond", "restart", "error", "audit"],
+        retrieval_hint=(
+            "Retrieve JCL, PROC, and PARM chunks whose IDs were discovered from the "
+            "jcl_analysis_jcl and jcl_analysis_procs sections. "
+            "Extract COND/restart behavior from JCL EXEC bodies and PROC step chunk text. "
+            "For PARM assets, use parsed key_values metadata and raw PARM text to document "
+            "runtime switches, overrides, and error-handling controls. "
+            "Use USES_PARM edges to link PARM members to the steps that consume them."
+        ),
+        min_chunks=2,
+        min_paths=1,
+        max_tokens=2500,
+        asset_type_filter=["JCL", "PROC", "PARM"],
+        depends_on=["jcl_analysis_jcl", "jcl_analysis_procs"],
+        cascade_from=["jcl_analysis_jcl", "jcl_analysis_procs"],
+    ),
+    "jcl_analysis_dependencies_and_integrations": SectionBlueprint(
+        section_name="jcl_analysis_dependencies_and_integrations",
+        title="Dependencies and Integrations",
+        objective=(
+            "List all external datasets, utilities, subsystems, and program-to-program "
+            "call dependencies discovered within this JCL lineage."
+        ),
+        prompt_key="jcl_analysis_dependencies_and_integrations",
+        required_evidence=["dataset", "call", "utility", "external"],
+        retrieval_hint=(
+            "Retrieve all asset chunks whose IDs were discovered across the full JCL "
+            "lineage (JCL, PROC, COBOL, COPYBOOK). "
+            "Traverse USES_PROC, EXECUTES_PROGRAM, and CALLS_PROGRAM to map control "
+            "dependencies within this lineage. "
+            "Use READS_DATASET / WRITES_DATASET / READS_OR_WRITES_DATASET for dataset "
+            "integration points, and identify utility programs named in EXEC targets. "
+            "Flag any subsystem references (DB2, CICS, MQ, IMS) found in COBOL source "
+            "or JCL DD statements."
+        ),
+        min_chunks=3,
+        min_paths=2,
+        max_tokens=2500,
+        asset_type_filter=[],
+        depends_on=[
+            "jcl_analysis_jcl",
+            "jcl_analysis_procs",
+            "jcl_analysis_cobol",
+            "jcl_analysis_copybooks",
+        ],
+        cascade_from=[
+            "jcl_analysis_jcl",
+            "jcl_analysis_procs",
+            "jcl_analysis_cobol",
+            "jcl_analysis_copybooks",
+        ],
+    ),
+    "jcl_analysis_gaps_and_assumptions": SectionBlueprint(
+        section_name="jcl_analysis_gaps_and_assumptions",
+        title="Gaps and Assumptions",
+        objective=(
+            "Report low-confidence items, unresolved identifiers, inferred facts, "
+            "and follow-up questions for SMEs arising from this JCL analysis."
+        ),
+        prompt_key="jcl_analysis_gaps_and_assumptions",
+        required_evidence=["confidence", "unsupported", "inferred"],
+        retrieval_hint=(
+            "Pull low-confidence items and inferred statements from all prior "
+            "jcl_analysis section drafts. "
+            "Flag unresolved identifiers and partial links across the full lineage "
+            "(missing EXEC targets, unmapped DD/DSN intent, unretrieved COBOL or copybook "
+            "sources, ambiguous PARM values, or incomplete COND code context)."
+        ),
+        min_chunks=1,
+        min_paths=0,
+        max_tokens=1500,
+        asset_type_filter=[],
+        depends_on=[
+            "jcl_analysis_jcl",
+            "jcl_analysis_procs",
+            "jcl_analysis_cobol",
+            "jcl_analysis_copybooks",
+            "jcl_analysis_operational_behavior",
+            "jcl_analysis_dependencies_and_integrations",
+        ],
+        cascade_from=[
+            "jcl_analysis_jcl",
+            "jcl_analysis_procs",
+            "jcl_analysis_cobol",
+            "jcl_analysis_copybooks",
+            "jcl_analysis_operational_behavior",
+            "jcl_analysis_dependencies_and_integrations",
+        ],
+    ),
+    # ------------------------------------------------------------------
+    # jcl_analysis Phase 2 — synthesis sections
+    # These consume prior draft text exclusively; no fresh chunk retrieval.
+    # ------------------------------------------------------------------
+    "jcl_analysis_application_overview": SectionBlueprint(
+        section_name="jcl_analysis_application_overview",
+        title="Application Overview",
+        objective=(
+            "Synthesise a component inventory and execution lineage for this JCL job "
+            "(job, PROCs, COBOL programs, copybooks, datasets, PARM members) with "
+            "relationships and scope boundaries, drawn from the verified Phase 1 drafts."
+        ),
+        prompt_key="jcl_analysis_application_overview",
+        required_evidence=[],
+        retrieval_hint=(
+            "Synthesis section — use prior_section_drafts exclusively. "
+            "No fresh chunk retrieval required."
+        ),
+        min_chunks=0,
+        min_paths=0,
+        max_tokens=4000,
+        asset_type_filter=[],
+        depends_on=[
+            "jcl_analysis_jcl",
+            "jcl_analysis_procs",
+            "jcl_analysis_cobol",
+            "jcl_analysis_copybooks",
+        ],
+    ),
+    "jcl_analysis_executive_summary": SectionBlueprint(
+        section_name="jcl_analysis_executive_summary",
+        title="Executive Summary",
+        objective=(
+            "Write a concise business-level summary of this JCL job: purpose, "
+            "batch execution flow, key capabilities, asset counts, and top risk."
+        ),
+        prompt_key="jcl_analysis_executive_summary",
+        required_evidence=[],
+        retrieval_hint=(
+            "Synthesis section — use prior_section_drafts exclusively. "
+            "No fresh chunk retrieval required."
+        ),
+        min_chunks=0,
+        min_paths=0,
+        max_tokens=2000,
+        asset_type_filter=[],
+        depends_on=[
+            "jcl_analysis_jcl",
+            "jcl_analysis_procs",
+            "jcl_analysis_cobol",
+            "jcl_analysis_copybooks",
+            "jcl_analysis_operational_behavior",
+            "jcl_analysis_dependencies_and_integrations",
+            "jcl_analysis_gaps_and_assumptions",
+        ],
+    ),
 }
 
 
@@ -225,12 +523,12 @@ class MainframeDocumentPlanner:
     def __init__(self, section_order: list[str] | None = None) -> None:
         self.section_order = section_order or list(DEFAULT_SECTION_ORDER)
 
-    def plan(
-        self, request: DocumentRequest, evidence_pack: EvidencePack | None = None
-    ) -> DocumentPlan:
+    def plan(self, request: DocumentRequest) -> DocumentPlan:
         plan_id = str(uuid4())
         sections: list[DocumentSection] = []
-        for section_name in self.section_order:
+        active_order = request.section_order or self.section_order
+        now_iso = datetime.now(timezone.utc).isoformat()
+        for section_name in active_order:
             blueprint = DEFAULT_BLUEPRINTS[section_name]
             sections.append(
                 DocumentSection(
@@ -246,6 +544,20 @@ class MainframeDocumentPlanner:
                     max_tokens=blueprint.max_tokens,
                     asset_type_filter=list(blueprint.asset_type_filter),
                     depends_on=list(blueprint.depends_on),
+                    cascade_from=list(blueprint.cascade_from),
+                    cascade_node_types=list(blueprint.cascade_node_types),
+                    # Runtime fields initialized with defaults
+                    status="pending",
+                    draft_markdown="",
+                    evidence_request_id=None,
+                    confidence=0.0,
+                    notes=[],
+                    retrieval_pass_id=None,
+                    retrieval_pass_number=None,
+                    discovered_asset_ids={},
+                    evidence_overview="",
+                    updated_at=now_iso,
+                    approval_notes=[],
                 )
             )
         return DocumentPlan(
@@ -254,9 +566,8 @@ class MainframeDocumentPlanner:
             run_id=request.run_id,
             sections=sections,
             metadata={
-                "document_style": request.document_style,
+                "document_type": request.document_type,
                 "user_role": request.user_role,
                 "topic": request.topic,
-                "has_initial_evidence": evidence_pack is not None,
             },
         )
