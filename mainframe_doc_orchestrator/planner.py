@@ -25,15 +25,15 @@ DEFAULT_SECTION_ORDER: list[str] = [
 DOCUMENT_TYPE_SECTIONS: dict[str, list[str]] = {
     "system_appreciation": list(DEFAULT_SECTION_ORDER),
     "jcl_analysis": [
-        "jcl_analysis_jcl",           # Phase 1 — seed: retrieves JCL chunks
-        "jcl_analysis_procs",          # Phase 1 — cascaded from JCL
-        "jcl_analysis_cobol",          # Phase 1 — cascaded from JCL + PROCs
-        "jcl_analysis_copybooks",      # Phase 1 — cascaded from COBOL
-        "jcl_analysis_operational_behavior",          # Phase 1 — cross-cutting: JCL/PROC/PARM
-        "jcl_analysis_dependencies_and_integrations", # Phase 1 — cross-cutting: full lineage
-        "jcl_analysis_gaps_and_assumptions",          # Phase 1 — evidence gaps
-        "jcl_analysis_application_overview",          # Phase 2 — synthesis
-        "jcl_analysis_executive_summary",             # Phase 2 — synthesis
+        "jcl_analysis_jcl",  # Phase 1 — seed: retrieves JCL chunks
+        "jcl_analysis_procs",  # Phase 1 — cascaded from JCL
+        "jcl_analysis_cobol",  # Phase 1 — cascaded from JCL + PROCs
+        "jcl_analysis_copybooks",  # Phase 1 — cascaded from COBOL
+        "jcl_analysis_operational_behavior",  # Phase 1 — cross-cutting: JCL/PROC/PARM
+        "jcl_analysis_dependencies_and_integrations",  # Phase 1 — cross-cutting: full lineage
+        "jcl_analysis_gaps_and_assumptions",  # Phase 1 — evidence gaps
+        "jcl_analysis_application_overview",  # Phase 2 — synthesis
+        "jcl_analysis_executive_summary",  # Phase 2 — synthesis
     ],
 }
 
@@ -226,7 +226,17 @@ DEFAULT_BLUEPRINTS: dict[str, SectionBlueprint] = {
         min_paths=0,
         max_tokens=4000,
         asset_type_filter=[],
-        depends_on=["jcl_and_procs", "cobol_programs", "copybooks_and_data_structures"],
+        # Depend on ALL Phase 1 sections so every asset type that surfaces in
+        # any section (e.g. a control JCL found only via operational_behavior)
+        # is visible to the inventory synthesis.
+        depends_on=[
+            "jcl_and_procs",
+            "cobol_programs",
+            "copybooks_and_data_structures",
+            "operational_behavior",
+            "dependencies_and_integrations",
+            "gaps_and_assumptions",
+        ],
     ),
     "executive_summary": SectionBlueprint(
         section_name="executive_summary",
@@ -282,7 +292,7 @@ DEFAULT_BLUEPRINTS: dict[str, SectionBlueprint] = {
         min_paths=3,
         max_tokens=3000,
         asset_type_filter=["JCL"],
-        cascade_node_types=["PROC", "COBOL", "PARM"],
+        cascade_node_types=["PROC", "COBOL", "PROGRAM", "PARM"],
     ),
     "jcl_analysis_procs": SectionBlueprint(
         section_name="jcl_analysis_procs",
@@ -306,7 +316,7 @@ DEFAULT_BLUEPRINTS: dict[str, SectionBlueprint] = {
         asset_type_filter=["PROC"],
         depends_on=["jcl_analysis_jcl"],
         cascade_from=["jcl_analysis_jcl"],
-        cascade_node_types=["COBOL", "PARM"],
+        cascade_node_types=["COBOL", "PROGRAM", "PARM"],
     ),
     "jcl_analysis_cobol": SectionBlueprint(
         section_name="jcl_analysis_cobol",
@@ -385,7 +395,6 @@ DEFAULT_BLUEPRINTS: dict[str, SectionBlueprint] = {
         max_tokens=2500,
         asset_type_filter=["JCL", "PROC", "PARM"],
         depends_on=["jcl_analysis_jcl", "jcl_analysis_procs"],
-        cascade_from=["jcl_analysis_jcl", "jcl_analysis_procs"],
     ),
     "jcl_analysis_dependencies_and_integrations": SectionBlueprint(
         section_name="jcl_analysis_dependencies_and_integrations",
@@ -528,8 +537,38 @@ class MainframeDocumentPlanner:
         sections: list[DocumentSection] = []
         active_order = request.section_order or self.section_order
         now_iso = datetime.now(timezone.utc).isoformat()
+
+        # Derive a complexity-aware min_chunks floor from the request's top_k_chunks.
+        # Formula: max(3, top_k_chunks // 5) — scales validator sensitivity so that
+        # complex estates (top_k=35 → floor=7) flag under-retrieval earlier than
+        # simple ones (top_k=10 → floor=3).  The blueprint's own min_chunks acts as
+        # a per-section lower bound so tightly-scoped sections (copybooks, gaps) are
+        # never penalised against the global floor.
+        top_k_chunks: int = int(request.metadata.get("top_k_chunks", 10))
+        complexity_min_chunks_floor: int = max(3, top_k_chunks // 5)
+        # Scale max_tokens proportionally for evidence sections so the LLM has
+        # enough output budget to cover all assets in a complex estate.
+        # Formula: max(blueprint, blueprint * top_k / 20) — at top_k=35 this is
+        # 1.75x the blueprint value; at top_k=20 it's 1.0x (no change).
+        # Synthesis sections (max_tokens capped at their own value) are unchanged.
+        complexity_max_tokens_scale: float = max(1.0, top_k_chunks / 20)
+
         for section_name in active_order:
             blueprint = DEFAULT_BLUEPRINTS[section_name]
+            # Apply the complexity floor only to evidence sections (min_chunks > 0).
+            # Synthesis sections (min_chunks == 0) are left unchanged.
+            effective_min_chunks = (
+                max(blueprint.min_chunks, complexity_min_chunks_floor)
+                if blueprint.min_chunks > 0
+                else 0
+            )
+            # Scale output budget for evidence sections; synthesis sections keep
+            # their fixed cap so the inventory/summary stays concise.
+            effective_max_tokens = (
+                int(blueprint.max_tokens * complexity_max_tokens_scale)
+                if blueprint.min_chunks > 0 and blueprint.max_tokens > 0
+                else blueprint.max_tokens
+            )
             sections.append(
                 DocumentSection(
                     section_id=f"{plan_id}:{section_name}",
@@ -539,9 +578,9 @@ class MainframeDocumentPlanner:
                     prompt_key=blueprint.prompt_key,
                     required_evidence=list(blueprint.required_evidence),
                     retrieval_hint=blueprint.retrieval_hint,
-                    min_chunks=blueprint.min_chunks,
+                    min_chunks=effective_min_chunks,
                     min_paths=blueprint.min_paths,
-                    max_tokens=blueprint.max_tokens,
+                    max_tokens=effective_max_tokens,
                     asset_type_filter=list(blueprint.asset_type_filter),
                     depends_on=list(blueprint.depends_on),
                     cascade_from=list(blueprint.cascade_from),
@@ -567,7 +606,6 @@ class MainframeDocumentPlanner:
             sections=sections,
             metadata={
                 "document_type": request.document_type,
-                "user_role": request.user_role,
                 "topic": request.topic,
             },
         )

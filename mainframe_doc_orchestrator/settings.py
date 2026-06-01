@@ -13,7 +13,6 @@ class Settings(BaseSettings):
     # APPLICATION
     # ============================================
     app_name: str = "Mainframe Document Orchestrator"
-    default_user_role: str = "analyst"
 
     # ============================================
     # DATABASE
@@ -65,6 +64,14 @@ class Settings(BaseSettings):
 
     # stub (path to a local evidence-pack JSON file)
     retrieval_stub_path: str = ""
+
+    # ============================================
+    # EXPORT
+    # ============================================
+    # Directory where exported documents are saved.
+    # Relative paths are resolved from the working directory at runtime.
+    # Override via EXPORT_OUTPUT_DIR in .env.
+    export_output_dir: str = "exports"
 
     # ============================================
     # RETRIEVAL PARAMETERS

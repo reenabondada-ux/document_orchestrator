@@ -24,6 +24,10 @@ PROMPTS: dict[str, dict[str, str]] = {
         "system": (
             "You are a senior mainframe batch analyst documenting JCL jobs and "
             "procedures. Use only the chunk_contents and graph_paths provided. "
+            "BEFORE writing, scan chunk_contents and identify every distinct asset_id "
+            "where asset_type is JCL or PROC. Your draft MUST contain one subsection "
+            "for every JCL job found and one subsection for every PROC found — "
+            "do not stop until all identified assets are documented. "
             "Do not describe the internal business logic of COBOL programs — "
             "name the programs and their invoking steps only. "
             "Label any inferences as [INFERRED]."
@@ -31,26 +35,36 @@ PROMPTS: dict[str, dict[str, str]] = {
         "user": """\
 Document all JCL jobs and procedures found in the evidence.
 
-For each **Job** (asset_type JCL):
-- State its business purpose (infer from name/comments if necessary — mark [INFERRED]).
-- List each **step** in execution order: step name, what it EXECs (PGM or PROC).
-- From the graph EXECUTES_PROGRAM edges: name the COBOL program invoked per step.
-- From the graph READS_DATASET / WRITES_DATASET edges: list datasets read and written per step.
+STEP 1 — Use the pre-resolved step map below as your AUTHORITATIVE list of every \
+job and step. Do NOT derive steps from raw JCL text — use this map only:
+
+{{jcl_step_map}}
+
+For each **Job** listed in the step map above:
+- State its business purpose (infer from name/comments — mark [INFERRED]).
+- Document EVERY step shown in the map, in order:
+  - Steps marked `EXEC PGM=<name>` directly execute that program.
+  - Steps marked `EXEC PROC=<name>` invoke a catalogued PROC. MUST document \
+this step. Then look up the PROC in the Procedures section (below) and list every \
+program that PROC runs (from proc-step chunks in chunk_contents or \
+EXECUTES_PROGRAM edges in graph_paths).
+- From READS_DATASET / WRITES_DATASET / READS_OR_WRITES_DATASET edges in \
+graph_paths: list datasets read and written per step.
 - Note any COND codes or conditional step logic visible in the source text.
 
-For each **Procedure** (asset_type PROC):
+For each **Procedure** (chunk_kind == "proc" or "proc-step" in chunk_contents):
 - State its role.
-- List proc steps and the programs they execute (EXECUTES_PROGRAM edges).
-- Note any dataset DD statements (READS_DATASET / WRITES_DATASET edges).
+- List every proc step in order: step name, PGM invoked.
+- Note any dataset DD statements and symbolic parameters.
 
-CRITICAL: Base all field values strictly on chunk_contents below. \
-Do NOT describe program logic — only note which program is called.
+CRITICAL: Every step in the jcl_step_map MUST appear in your output. \
+Do NOT describe program logic — name programs only.
 
-Chunk contents (authoritative source text):
+Chunk contents (source text and metadata for each chunk):
 {{chunk_contents}}
 
-Graph paths (use for EXECUTES_PROGRAM, READS_DATASET, WRITES_DATASET, \
-USES_PROC relationships):
+Graph paths (EXECUTES_PROGRAM, USES_PROC, HAS_PROC_STEP, READS_DATASET, \
+WRITES_DATASET, READS_OR_WRITES_DATASET):
 {{graph_paths}}
 
 Supporting chunk IDs: {{supporting_chunks}}
@@ -174,7 +188,9 @@ Group by type:
 - **Program-to-program calls** — only COBOL CALL statements evidenced by CALLS_PROGRAM graph edges. \
 If no CALLS_PROGRAM edge exists for a program, write "None identified" for this group. \
 DO NOT list PERFORM statements — PERFORM invokes an internal paragraph within the same program, \
-not an external program.
+not an external program. \
+DO NOT list EXECUTES_PROGRAM edges — those represent a JCL or PROC step launching a program, \
+not a COBOL program calling another program via CALL.
 - **Subsystem interfaces** — any DB2, CICS, MQ, or other subsystem references visible in the source.
 
 CRITICAL: Only list items present in chunk_contents or graph_paths. \
@@ -233,11 +249,24 @@ Write an Application Overview section that gives a reader a complete inventory a
 component map of the system.
 
 Include:
-1. **Component inventory** — table or grouped list of: JCL jobs, PROCs, COBOL programs, \
-copybooks, and key datasets. Count each type.
-2. **Component relationships** — how jobs invoke PROCs and programs; which programs \
-use which copybooks; key dataset flows between components.
-3. **Scope boundaries** — what is definitively in scope, what appears to be external, \
+1. **Component Inventory** — a single Markdown table with three columns:
+   | Component Type | Count | Component Name(s) |
+   List every JCL job, PROC, COBOL program, copybook, and key dataset as its own row.
+   The "Component Name(s)" column must list every individual asset name for that type \
+(in a separate line). Do not split this into a separate detailed list — all information \
+goes in the table.
+
+2. **Component Relationships** — describe how components connect:
+   - For each JCL job, list every step and how it invokes downstream components:
+     - Steps that invoke a PROC directly (USES_PROC): state "[JOB] step [STEP] \
+executes PROC [PROC], which in turn runs COBOL program(s) [list from PROC steps]".
+     - Steps that invoke a COBOL program directly (EXECUTES_PROGRAM): state \
+"[JOB] step [STEP] directly executes [PROGRAM]".
+   - For each COBOL program, list which copybooks it uses (USES_COPYBOOK).
+   - List key dataset flows: which jobs/programs read or write shared datasets.
+   Do NOT summarise to job level only — step-level and PROC-mediated chains are required.
+
+3. **Scope Boundaries** — what is definitively in scope, what appears external, \
 and what is unresolved.
 
 Base this section entirely on the verified drafts below. Do not retrieve new evidence.
@@ -258,12 +287,23 @@ System: {{system_id}}
         "user": """\
 Write a concise Executive Summary.
 
+BEFORE writing, scan the Application Overview component inventory table in \
+prior_section_drafts and extract EXACT counts for each of these four types:
+- JCL jobs (rows where Component Type = "JCL Job" or similar)
+- PROCs / Procedures (rows where Component Type = "PROC" or "Procedure" or similar)
+- COBOL programs (rows where Component Type = "COBOL Program" or similar)
+- Copybooks (rows where Component Type = "Copybook" or similar)
+
+Use those extracted counts verbatim in point 4 below. Do NOT guess or combine types.
+
 Cover:
 1. **System purpose** — what business problem this mainframe estate solves (1–2 sentences).
 2. **Major batch flows** — name the key job streams and what each does at a business level.
 3. **Key business capabilities** — the most important functions delivered (billing, \
 payment processing, reconciliation, etc.).
-4. **Component count** — a one-line inventory: X jobs, Y programs, Z copybooks.
+4. **Component count** — a one-line inventory using the counts you extracted above: \
+"X jobs, Y PROCs, Z COBOL programs, N copybooks." \
+All four values are MANDATORY — PROCs must never be merged into programs or omitted.
 5. **Notable risks or gaps** — one sentence summarising the most significant uncertainty.
 
 Base this summary entirely on the verified drafts below.
@@ -289,18 +329,20 @@ Document all JCL jobs found in the evidence.
 
 For each **Job**:
 - State its business purpose (infer from name/comments — mark [INFERRED]).
-- List each **step** in execution order: step name and what it EXECs (PGM or PROC).
-- From EXECUTES_PROGRAM graph edges: name the COBOL program invoked per step.
-- From USES_PROC graph edges: name any catalogued PROC expanded per step.
-- From READS_DATASET / WRITES_DATASET edges: list datasets read and written per step.
-- Note any COND codes or conditional step logic visible in the source.
+- Document every step in order:
+  - Steps with `EXEC PGM=<name>` directly execute that program.
+  - Steps with `EXEC PROC=<name>` invoke a catalogued PROC. Document the step, \
+then look up the PROC in graph_paths (USES_PROC → HAS_PROC_STEP → EXECUTES_PROGRAM) \
+to list every program it runs.
+- From READS_DATASET / WRITES_DATASET edges: list datasets per step.
+- Note COND codes or conditional step logic visible in the source.
 
-CRITICAL: Base all values strictly on chunk_contents. Do not invent logic.
+CRITICAL: Document every step present in chunk_contents. Do not skip PROC-invoking steps.
 
 Chunk contents:
 {{chunk_contents}}
 
-Graph paths (EXECUTES_PROGRAM, USES_PROC, READS_DATASET, WRITES_DATASET, READS_OR_WRITES_DATASET):
+Graph paths (EXECUTES_PROGRAM, USES_PROC, HAS_PROC_STEP, READS_DATASET, WRITES_DATASET, READS_OR_WRITES_DATASET):
 {{graph_paths}}
 
 System: {{system_id}}
@@ -472,7 +514,9 @@ Note whether each is input-only, output-only, or bidirectional.
 via a CALL statement, evidenced by a CALLS_PROGRAM graph edge (caller → callee). \
 If no CALLS_PROGRAM edge exists, write "None identified" for this group. \
 DO NOT list PERFORM statements or names from 'internal_paragraph_performs' metadata — \
-PERFORM invokes an internal paragraph within the same program, not an external program.
+PERFORM invokes an internal paragraph within the same program, not an external program. \
+DO NOT list EXECUTES_PROGRAM edges — those represent a JCL or PROC step launching a \
+program, not a COBOL program calling another program via CALL.
 - **Subsystem interfaces** — any DB2, CICS, MQ, IMS, or other subsystem references \
 visible in COBOL source or JCL DD statements within this lineage.
 - **PARM dependencies** — PARM members that govern runtime behavior of programs in \
@@ -547,9 +591,12 @@ System: {{system_id}}
 Write an Application Overview for this JCL and its full asset lineage.
 
 Include:
-1. **Component inventory** — table or grouped list of: the JCL job, PROCs it invokes, \
-COBOL programs executed (directly or via PROCs), copybooks expanded by those programs, \
-key datasets, and PARM members. Include a count for each type.
+1. **Component Inventory** — a single Markdown table with three columns:
+   | Component Type | Count | Component Name(s) |
+   List every JCL job, PROC, COBOL program, copybook, and key dataset as its own row.
+   The "Component Name(s)" column must list every individual asset name for that type \
+(in a separate line). Do not split this into a separate detailed list — all information \
+goes in the table.
 2. **Component relationships and Execution lineage** - Highlight key relationships: 
 how the JCL invokes PROCs and programs; which programs use 
 which copybooks; key dataset flows between steps; PARM dependencies.

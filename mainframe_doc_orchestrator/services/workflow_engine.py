@@ -109,6 +109,32 @@ class DocumentWorkflowEngine:
         )
         retrieval_request = self._build_retrieval_request(section, sections, plan_dict)
 
+        # Short-circuit: if this section cascades from upstream sections but no
+        # relevant asset IDs were discovered (e.g. no PROCs in a JCL-only job,
+        # or no COBOL programs in a PROC-only lineage), skip retrieval and emit
+        # a concise "none found" note rather than retrieving unrelated chunks.
+        if section.cascade_from and not retrieval_request.filters.asset_ids:
+            upstream_names = ", ".join(section.cascade_from)
+            skip_note = (
+                f"No assets of this type were discovered in the upstream sections "
+                f"({upstream_names}). Retrieval skipped."
+            )
+            section.status = "review_ready"
+            section.draft_markdown = (
+                f"## {section.title}\n\n"
+                f"_{skip_note}_"
+            )
+            section.confidence = 1.0
+            section.notes = [skip_note]
+            section.evidence_overview = f"Skipped — {skip_note}"
+            section.discovered_asset_ids = {}
+            section.updated_at = self._now_iso()
+            plan_dict["sections"] = sections_map_to_stored_sections_list(sections)
+            await self.document_repository.update_run(
+                run_id, plan=plan_dict, status=self._derive_run_status(sections)
+            )
+            return await self.get_section(run_id, section.section_name)
+
         # Crash-recovery: if a completed pass already exists with an
         # evidence_request_id, the previous run completed retrieval but
         # crashed before finishing draft writing.  Re-fetch the pack via
@@ -208,6 +234,41 @@ class DocumentWorkflowEngine:
             raise ValueError("No pending sections left to generate.")
         return await self.generate_section(run_id, next_section.section_name)
 
+    async def generate_all_sections(
+        self, run_id: str
+    ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+        """Generate every pending section in plan order, respecting depends_on.
+
+        Iterates ``section_order`` sequentially.  Sections already at
+        ``review_ready`` or ``approved`` are skipped.  On a per-section error
+        the failure is recorded and iteration stops (downstream sections that
+        depend_on the failed one would fail too).  The run dict and a (possibly
+        empty) list of error records are returned so the caller can surface
+        partial results.
+        """
+        run = await self.document_repository.get_run(run_id)
+        section_order: list[str] = run["plan"].get("section_order", [])
+        errors: list[dict[str, Any]] = []
+
+        for section_name in section_order:
+            # Re-fetch run state each iteration so status reflects prior writes.
+            run = await self.document_repository.get_run(run_id)
+            sections = stored_sections_list_to_sections_map(
+                run["plan"].get("sections", [])
+            )
+            section = sections.get(section_name)
+            if section is None or section.status in {"review_ready", "approved"}:
+                continue
+            try:
+                await self.generate_section(run_id, section_name)
+            except Exception as exc:  # noqa: BLE001
+                errors.append({"section_name": section_name, "error": str(exc)})
+                # Stop: later sections may depend on this one.
+                break
+
+        run = await self.document_repository.get_run(run_id)
+        return run, errors
+
     async def approve_section(
         self, run_id: str, section_name: str, notes: str | None = None
     ) -> dict[str, Any]:
@@ -231,17 +292,26 @@ class DocumentWorkflowEngine:
     ) -> dict[str, Any]:
         run = await self.document_repository.get_run(run_id)
         draft = self._draft_from_plan(run)
-        if output_format == "markdown":
-            exported = self.exporter.export_markdown(draft)
-        else:
-            raise ValueError(f"Unsupported export format: {output_format}")
+        exported = self.exporter.export(draft, output_format)
+        file_path = self.exporter.save_to_disk(
+            exported, draft.title, run_id, output_format
+        )
         await self.document_repository.update_run(
             run_id,
             status="exported",
             completed_at=self._now_iso(),
-            export_artifact={"format": output_format, "content": exported},
+            export_artifact={
+                "format": output_format,
+                "content": exported,
+                "file_path": file_path,
+            },
         )
-        return {"run_id": run_id, "format": output_format, "content": exported}
+        return {
+            "run_id": run_id,
+            "format": output_format,
+            "content": exported,
+            "file_path": file_path,
+        }
 
     async def get_events(self, run_id: str) -> list[dict[str, Any]]:
         run = await self.document_repository.get_run(run_id)
@@ -299,7 +369,6 @@ class DocumentWorkflowEngine:
             "run_id": plan.run_id,
             "document_title": f"{request.system_id} — {label}",
             "document_type": request.document_type,
-            "user_role": request.user_role,
             "topic": request.topic,
             "section_order": request.section_order,
             "sections": sections_list,
@@ -312,7 +381,6 @@ class DocumentWorkflowEngine:
         return DocumentRequest(
             run_id=run_id,
             system_id=plan["system_id"],
-            user_role=plan.get("user_role", "analyst"),
             document_type=plan.get("document_type", "system_appreciation"),
             output_format=plan.get("metadata", {}).get("output_format", "markdown"),
             topic=plan.get("topic", ""),
@@ -336,18 +404,51 @@ class DocumentWorkflowEngine:
             if section.asset_type_filter
             else list(initial_request_filters.get("asset_types", []))
         )
-        # Cascade: collect asset IDs discovered by upstream sections.
+        # Cascade: collect asset IDs discovered by upstream sections,
+        # filtered to only those matching this section's asset_type_filter.
+        # This prevents e.g. COBOL__BAL900 from leaking into jcl_analysis_procs
+        # just because it was harvested alongside PROC nodes upstream.
+        #
+        # Filtering strategy: iterate discovered_asset_ids buckets by node_type key.
+        # A bucket is included if:
+        #  (a) no asset_type_filter is set (take all), OR
+        #  (b) the bucket's node_type is in asset_types (e.g. "COPYBOOK" → COPYBOOK
+        #      bucket, matching IDs like "COPYBOOK__*"), OR
+        #  (c) the IDs in this bucket start with an asset_type_filter prefix
+        #      (handles the COBOL asset_type vs "PROGRAM" node_type mismatch where
+        #      Neo4j stores COBOL nodes with type="PROGRAM" but id="COBOL__*").
         cascaded_asset_ids: list[str] = []
         if section.cascade_from:
+            type_prefixes = tuple(f"{t}__" for t in asset_types) if asset_types else ()
             for upstream_name in section.cascade_from:
                 upstream_section = sections.get(upstream_name)
                 if upstream_section is not None:
-                    for asset_ids in upstream_section.discovered_asset_ids.values():
-                        cascaded_asset_ids.extend(asset_ids)
+                    for node_type, ids in upstream_section.discovered_asset_ids.items():
+                        if not asset_types:
+                            # No filter — take everything
+                            cascaded_asset_ids.extend(ids)
+                        elif node_type in asset_types:
+                            # Bucket node_type matches filter directly (e.g. PROC, COPYBOOK)
+                            cascaded_asset_ids.extend(ids)
+                        elif type_prefixes:
+                            # Fallback: keep individual IDs whose prefix matches
+                            # (e.g. COBOL__ prefix despite node_type being PROGRAM)
+                            cascaded_asset_ids.extend(
+                                aid for aid in ids if aid.startswith(type_prefixes)
+                            )
+        # When a section cascades from upstream sections but no asset IDs were
+        # discovered (e.g. a JCL job that invokes no PROCs), keep asset_ids empty
+        # so retrieval returns nothing rather than falling back to the original
+        # request filters and pulling in unrelated chunks.
+        if section.cascade_from:
+            resolved_asset_ids = cascaded_asset_ids
+        else:
+            resolved_asset_ids = cascaded_asset_ids or list(
+                initial_request_filters.get("asset_ids", [])
+            )
         filters = RetrievalFilters(
             asset_types=asset_types,
-            asset_ids=cascaded_asset_ids
-            or list(initial_request_filters.get("asset_ids", [])),
+            asset_ids=resolved_asset_ids,
             domains=list(initial_request_filters.get("domains", [])),
         )
         system_id = plan_dict["system_id"]
@@ -431,7 +532,7 @@ class DocumentWorkflowEngine:
                         notes=list(section.notes),
                     )
                 )
-        draft = DocumentDraft(
+        return DocumentDraft(
             run_id=run["run_id"],
             system_id=run["system_id"],
             title=run["document_title"],
@@ -440,8 +541,6 @@ class DocumentWorkflowEngine:
             confidence=0.0,
             metadata={"plan": plan_dict, "run_status": run["status"]},
         )
-        draft.rendered_markdown = self.exporter.export_markdown(draft)
-        return draft
 
     @staticmethod
     def _now_iso() -> str:

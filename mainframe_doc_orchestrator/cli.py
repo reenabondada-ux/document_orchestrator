@@ -63,7 +63,6 @@ def main() -> None:
         "--section", default="batch_flow_overview", help="Initial section focus."
     )
     parser.add_argument("--system-id", default="", help="System id override.")
-    parser.add_argument("--user-role", default="analyst", help="User role.")
     args = parser.parse_args()
     config = load_config(args.config)
     llm_client = build_llm(config)
@@ -85,7 +84,6 @@ def main() -> None:
     )
     request = DocumentRequest(
         system_id=system_id,
-        user_role=args.user_role,
         document_style=config.get("document_style", "system_appreciation"),
         output_format=config.get("output_format", "markdown"),
         topic=topic,

@@ -63,7 +63,7 @@
     "jobs":      ["JCL__BILLRUN1"],
     "procs":     ["PROC__ABPBLD1"],
     "programs":  ["COBOL__BLD001"],
-    "copybooks": ["COPYLIB__CUSTH01", "COPYLIB__TRNID01", "COPYLIB__BILLRUL"],
+    "copybooks": ["COPYBOOK__CUSTH01", "COPYBOOK__TRNID01", "COPYBOOK__BILLRUL"],
     "parms":     ["PARM__BLDPARM"]
   },
   "evidence_items": [

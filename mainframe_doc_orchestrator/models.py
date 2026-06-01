@@ -52,6 +52,7 @@ class ChunkContent:
     source_file: str
     line_start: int
     line_end: int
+    metadata: Dict[str, Any] = field(default_factory=dict)
 
 @dataclass(slots=True)
 class EvidenceItem:
@@ -138,7 +139,6 @@ class DocumentPlan:
 class DocumentRequest:
     run_id: str = field(default_factory=lambda: str(uuid4()))
     system_id: str = ""
-    user_role: str = ""
     document_type: str = "system_appreciation"
     output_format: str = "markdown"
     topic: str = ""

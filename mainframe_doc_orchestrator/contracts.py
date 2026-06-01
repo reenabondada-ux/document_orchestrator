@@ -13,7 +13,7 @@ class LLMClient(Protocol):
     model_name: str
     max_output_tokens: int
     temperature: float
-    async def generate(self, *, system_prompt: str, user_prompt: str) -> str: ...
+    async def generate(self, *, system_prompt: str, user_prompt: str, max_tokens: int | None = None) -> str: ...
 
 @runtime_checkable
 class DocumentPlanner(Protocol):

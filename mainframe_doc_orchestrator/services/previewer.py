@@ -13,6 +13,7 @@ Usage::
 from __future__ import annotations
 
 import markdown as _md
+from mainframe_doc_orchestrator.prompt_library import ASSEMBLY_ORDERS, DEFAULT_ASSEMBLY_ORDER
 
 _REVIEW_READY_BADGE = (
     '<span style="background:#d97706;color:#fff;font-size:0.75rem;'
@@ -200,7 +201,14 @@ def render_preview_html(run: dict) -> str:
         A UTF-8 HTML string ready for a ``text/html`` HTTP response.
     """
     plan = run.get("plan", {})
-    sections: list[dict] = plan.get("sections", [])
+    _raw_sections: list[dict] = plan.get("sections", [])
+    document_type: str = plan.get("document_type", "")
+    _order = ASSEMBLY_ORDERS.get(document_type, DEFAULT_ASSEMBLY_ORDER)
+    _order_index = {name: i for i, name in enumerate(_order)}
+    sections: list[dict] = sorted(
+        _raw_sections,
+        key=lambda s: _order_index.get(s.get("section_name", ""), len(_order)),
+    )
     title = run.get(
         "document_title", f"System Appreciation Document — {run.get('system_id', '')}"
     )

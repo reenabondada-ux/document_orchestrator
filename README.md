@@ -28,10 +28,11 @@ tests/
 
 ### 1. Create and activate a virtual environment
 
-Run the following from the **project root** (`document_orchestrator_repo/`). This creates `.venv/` inside the repo, keeping dependencies isolated to this project and separate from any other projects on your machine.
+Run the following from the project root. This creates `.venv/` inside the repo,
+keeping dependencies isolated to this project.
 
 ```bash
-cd document_orchestrator_repo   # ensure you are in the project root
+cd document_orchestrator_repo
 python -m venv .venv
 source .venv/bin/activate
 ```
@@ -51,10 +52,10 @@ cp .env.example .env
 # Edit .env — set POSTGRES_DSN and any LLM provider credentials
 ```
 
-### 4. Apply the database schema (pre-deploy, run once)
+### 4. Apply the database schema
 
-Schema management is intentionally **separate from the application**.
-The app never runs DDL at startup — it only opens a connection pool.
+Schema management is intentionally separate from the application. The app never
+runs DDL at startup.
 
 ```bash
 psql "$POSTGRES_DSN" -f database/schema.sql
@@ -62,18 +63,18 @@ psql "$POSTGRES_DSN" -f database/schema.sql
 
 All statements are idempotent (`IF NOT EXISTS`), so re-running is safe.
 
-**When the schema needs to change**, add a numbered SQL file under `database/migrations/`
-(e.g. `0001_add_column_x.sql`) containing only the incremental DDL, then run the
-migration script instead of plain `psql`:
+**When the schema needs to change**, add a numbered SQL file under
+`database/migrations/` (for example `0001_add_column_x.sql`) containing only the
+incremental DDL, then run:
 
 ```bash
-python scripts/migrate.py          # reads POSTGRES_DSN from .env
-python scripts/migrate.py --dsn "postgresql://..."  # explicit override
+python scripts/migrate.py
+python scripts/migrate.py --dsn "postgresql://..."
 ```
 
-`migrate.py` applies `schema.sql` (no-op if already up to date) followed by every
-file in `database/migrations/` in lexicographic order.  Write each migration
-idempotently (`ADD COLUMN IF NOT EXISTS`, etc.) so re-runs are safe.
+`migrate.py` applies `schema.sql` first, then every file in
+`database/migrations/` in lexicographic order. Write each migration
+idempotently (`ADD COLUMN IN NOT EXISTS`, etc.) so re-runs are safe.
 
 ### 5. Start the API
 
@@ -88,95 +89,129 @@ Once running, the API is available at:
 | API base | `http://localhost:8002` |
 | Interactive docs (Swagger UI) | `http://localhost:8002/docs` |
 | OpenAPI schema (JSON) | `http://localhost:8002/openapi.json` |
+| Dashboard | `http://localhost:8002/documents/dashboard` |
 
-**Endpoints:**
+## API surface
+
+### User-facing endpoints in Swagger UI
 
 | Method | Path | Description |
 |---|---|---|
-| `POST` | `/documents` | Create a new document run |
-| `GET` | `/documents` | List all runs |
-| `GET` | `/documents/{run_id}` | Get a run |
+| `POST` | `/documents` | Create a new document run; optionally bulk-generate all sections with `auto_generate=true` |
+| `POST` | `/documents/{run_id}/generate-all` | Generate all pending sections in one synchronous call |
 | `POST` | `/documents/{run_id}/generate` | Generate the next pending section |
-| `GET` | `/documents/{run_id}/sections` | List section drafts |
-| `GET` | `/documents/{run_id}/sections/{section_name}` | Get a specific section |
 | `POST` | `/documents/{run_id}/sections/{section_name}/approve` | Approve a section |
 | `POST` | `/documents/{run_id}/sections/{section_name}/regenerate` | Regenerate a section |
-| `GET` | `/documents/{run_id}/retrieval-passes` | List retrieval passes for a run |
-| `GET` | `/documents/{run_id}/events` | View lifecycle events |
 | `POST` | `/documents/{run_id}/export` | Export the final document |
+
+### Dashboard/backing endpoints
+
+These endpoints are still implemented, but hidden from Swagger/OpenAPI because
+the primary user flow is now create → review in dashboard → approve/regenerate → export.
+
+- `GET /documents`
+- `GET /documents/{run_id}`
+- `GET /documents/{run_id}/sections`
+- `GET /documents/{run_id}/sections/{section_name}`
+- `GET /documents/{run_id}/retrieval-passes`
+- `GET /documents/{run_id}/events`
+- `GET /documents/dashboard`
+- `GET /documents/{run_id}/preview`
 
 See [docs/API.md](docs/API.md) for full request/response details.
 
 ## Endpoint invocation sequence
 
-The workflow is **stateful** — sections must be generated in the correct order
-because Phase 2 synthesis sections (`application_overview`, `executive_summary`)
-depend on Phase 1 drafts being approved first.
+The workflow is **stateful**. Sections must be generated in plan order because the
+Phase 2 synthesis sections (`application_overview`, `executive_summary`) depend
+on Phase 1 sections being at least `review_ready` or `approved`.
+
+### Option A — create and generate everything in one call
+
+```
+1.  POST /documents
+        Body: include "auto_generate": true
+        → creates the run
+        → generates all pending sections synchronously in plan order
+        → returns run status only (not inline section drafts)
+        → if an intermediate section fails, the response still returns the run
+          plus auto_generate_errors so processing can resume later from that point
+
+2.  Review results in the dashboard / preview links
+
+3.  POST /documents/{run_id}/sections/{section_name}/approve
+        (or /regenerate if the draft needs another pass)
+
+4.  POST /documents/{run_id}/export
+        → returns the assembled Markdown document.
+```
+
+### Option B — create first, then generate later
 
 ```
 1.  POST /documents
         Body: see example payload below
-        → returns run_id
+        → returns run_id and initial run status
 
-2.  Repeat until all Phase 1 sections are review_ready:
+2a. POST /documents/{run_id}/generate-all
+        → generates all remaining pending sections synchronously
+        → stops on first failing section and returns partial progress
+
+2b. Or repeat manually:
         POST /documents/{run_id}/generate
         → generates the next pending section in generation order:
               jcl_and_procs → cobol_programs → copybooks_and_data_structures
               → operational_behavior → dependencies_and_integrations → gaps_and_assumptions
-        GET  /documents/{run_id}/sections/{section_name}   ← review the draft
-        POST /documents/{run_id}/sections/{section_name}/approve
-             (or /regenerate if the draft needs another pass)
+              → application_overview → executive_summary
 
-3.  Once all six Phase 1 sections are approved, repeat step 2 for Phase 2:
-              application_overview → executive_summary
-        These sections synthesise from the approved Phase 1 drafts; no fresh
-        retrieval is performed. The dependency guard will reject a generate call
-        if any required Phase 1 section is not yet review_ready or approved.
+3.  Review results in the dashboard / preview links
 
-4.  POST /documents/{run_id}/export
+4.  Approve or regenerate sections as needed
+
+5.  POST /documents/{run_id}/export
         → returns the assembled Markdown document.
         Sections are ordered for reading: Executive Summary → Application Overview
         → detail sections (JCL/PROC, COBOL, Copybooks, Operational, Dependencies, Gaps).
 ```
 
 > **Tip:** `POST /documents/{run_id}/generate` always picks the next pending section
-> automatically — you do not need to specify the section name. Call it in a loop
-> until `GET /documents/{run_id}` shows `status: complete`.
+> automatically — you do not need to specify the section name.
 
-### Example payload to generate system appreciation document — POST /documents
+> **Bulk generation behaviour:** `auto_generate=true` on `POST /documents` and
+> `POST /documents/{run_id}/generate-all` are intentionally long-running,
+> synchronous calls. If a section fails, previously generated sections remain
+> persisted and the response includes `auto_generate_errors` so you can fix the
+> issue and retry from that point later.
+
+## Example payloads
+
+### System appreciation document — `POST /documents`
 
 ```json
 {
-  "system_id": "ACME_BILLING_ESTATE",
-  "document_title": "ACME Billing & Payment System — System Appreciation Document",
+  "system_id": "MAINFRAME_POC_ESTATE",
   "document_type": "system_appreciation",
-  "user_role": "analyst",
-  "topic": "Monthly billing, daily payment application, and reconciliation control flows across BILLRUN1, PMTRUN7, and CTRLJOB",
-  "jcl_complexity": "medium",
-  "top_k_chunks": 10,
+  "topic": "Analyse and document mainframe POC estate",
+  "complexity": "complex",
+  "auto_generate": true,
   "filters": {
-    "asset_types": ["JCL", "PROC", "COBOL", "COPYBOOK", "PARM"],
-    "asset_ids": [],
-    "domains": ["billing", "payments", "reconciliation"]
+    "asset_types": ["JCL", "PROC", "COBOL", "COPYBOOK", "PARM"]
   },
   "metadata": {
     "output_format": "markdown",
-    "prior_run_ids": [],
-    "source_bundle": "mainframe_poc_bundle"
   }
 }
 ```
 
-### Example payload to generate a JCL analysis document - POST /documents
+### JCL analysis document — `POST /documents`
 
-``` json
+```json
 {
   "system_id": "JCL_ANALYSIS_BILLRUN1",
   "document_type": "jcl_analysis",
-  "user_role": "analyst",
   "topic": "Analyse billing flow in BILLRUN1 JCL",
-  "jcl_complexity": "medium",
-  "top_k_chunks": 10,
+  "complexity": "medium",
+  "auto_generate": false,
   "filters": {
     "asset_types": ["JCL", "PROC", "COBOL", "COPYBOOK", "PARM"],
     "asset_ids": ["JCL__BILLRUN1"]
@@ -184,20 +219,23 @@ depend on Phase 1 drafts being approved first.
 }
 ```
 
-**Field notes:**
-- `jcl_complexity` — convenience hint that drives `top_k_paths` when `top_k_paths` is not explicitly set (`simple`→9, `medium`→15, `complex`→25). Use `"complex"` for jobs with 5+ steps or many copybooks.
-- `top_k_chunks` — chunks retrieved per section. 10 gives solid coverage across all asset types without overwhelming context.
-- `filters.asset_types` — plan-level allow-list; each section's `asset_type_filter` in the blueprint narrows this further at retrieval time (e.g. the copybooks section will only retrieve `COPYBOOK` chunks regardless of what is listed here).
-- `filters.asset_ids` — leave empty to let the semantic query and `asset_types` do the scoping. Populate only for targeted regenerate passes against a specific known asset set.
-- `retrieval_request` — **not** part of the payload. `POST /documents` only creates the plan; the RAG retrieval service is called once per section inside each `POST /documents/{run_id}/generate` invocation.
+## Field notes
+
+- `complexity` — convenience hint that drives `top_k_chunks` and `top_k_paths` values (`simple`→10, `medium`→20, `complex`→35).
+- `auto_generate` — when `true`, `POST /documents` immediately generates all pending sections in plan order before returning.
+- `filters.asset_types` — plan-level allow-list; each section's `asset_type_filter` in the blueprint narrows this further at retrieval time.
+- `filters.asset_ids` — leave empty for broader semantic scope; populate only for targeted runs against a known asset set.
+- `metadata` — optional pass-through bag for run metadata such as `output_format`, `prior_run_ids`, or source bundle identifiers.
+- `retrieval_request` — not part of the payload. Retrieval happens per section during `generate`, `generate-all`, or `create` when `auto_generate=true`.
+- `DocumentRunResponse.auto_generate_errors` — populated only when bulk generation hits an intermediate failure and returns partial progress.
 
 ## Deployment order
 
 ```
 1. Build and push the new image / release
-2. psql "$POSTGRES_DSN" -f database/schema.sql   ← always before app start
+2. psql "$POSTGRES_DSN" -f database/schema.sql
 3. Start / restart the application
 ```
 
-In Kubernetes this is typically an **init container** that runs step 2 before
-the main container starts.
+In Kubernetes this is typically an init container that runs step 2 before the
+main container starts.

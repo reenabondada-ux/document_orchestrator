@@ -24,7 +24,7 @@ class EchoLLMClient:
         self.max_output_tokens = max_output_tokens
         self.temperature = temperature
 
-    async def generate(self, *, system_prompt: str, user_prompt: str) -> str:
+    async def generate(self, *, system_prompt: str, user_prompt: str, max_tokens: int | None = None) -> str:
         return (
             "# Echo Model Output\n\n"
             f"## System Prompt\n{system_prompt}\n\n"
@@ -49,7 +49,7 @@ class OpenAICompatibleLLMClient:
         self.max_output_tokens = max_output_tokens
         self.temperature = temperature
 
-    async def generate(self, *, system_prompt: str, user_prompt: str) -> str:
+    async def generate(self, *, system_prompt: str, user_prompt: str, max_tokens: int | None = None) -> str:
         payload = {
             "model": self.model_name,
             "messages": [
@@ -57,7 +57,7 @@ class OpenAICompatibleLLMClient:
                 {"role": "user", "content": user_prompt},
             ],
             "temperature": self.temperature,
-            "max_tokens": self.max_output_tokens,
+            "max_tokens": max_tokens or self.max_output_tokens,
         }
         headers: dict[str, str] = {"Content-Type": "application/json"}
         if self.api_key:
@@ -81,13 +81,13 @@ class BedrockLLMClient:
         self.max_output_tokens = max_output_tokens
         self.temperature = temperature
 
-    async def generate(self, *, system_prompt: str, user_prompt: str) -> str:
+    async def generate(self, *, system_prompt: str, user_prompt: str, max_tokens: int | None = None) -> str:
         return await asyncio.to_thread(
             self._generate_sync,
             system_prompt,
             user_prompt,
             self.temperature,
-            self.max_output_tokens,
+            max_tokens or self.max_output_tokens,
         )
 
     def _generate_sync(

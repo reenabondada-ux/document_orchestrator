@@ -17,12 +17,12 @@ from fastapi.responses import HTMLResponse
 from mainframe_doc_orchestrator.api.dependencies import get_workflow
 from mainframe_doc_orchestrator.api.schemas import (
     ApproveSectionRequest,
+    COMPLEXITY_RETRIEVAL_PARAMS,
     DocumentCreateRequest,
     DocumentRunResponse,
     ExportRequest,
     ExportResponse,
     GenerateRequest,
-    JCL_COMPLEXITY_TOP_K,
     RetrievalPassResponse,
     SectionResponse,
 )
@@ -40,15 +40,10 @@ router = APIRouter(prefix="/documents", tags=["documents"])
 
 
 def _to_domain_request(payload: DocumentCreateRequest) -> DocumentRequest:
-    effective_top_k_paths = (
-        payload.top_k_paths
-        if payload.top_k_paths is not None
-        else JCL_COMPLEXITY_TOP_K[payload.jcl_complexity]
-    )
+    top_k_chunks, top_k_paths = COMPLEXITY_RETRIEVAL_PARAMS[payload.complexity]
 
     return DocumentRequest(
         system_id=payload.system_id,
-        user_role=payload.user_role,
         document_type=payload.document_type,
         output_format="markdown",
         topic=payload.topic,
@@ -56,8 +51,8 @@ def _to_domain_request(payload: DocumentCreateRequest) -> DocumentRequest:
         retrieval_request=None,  # populated per-section during generate_section
         metadata={
             "filters": payload.model_dump().get("filters", {}),
-            "top_k_chunks": payload.top_k_chunks,
-            "top_k_paths": effective_top_k_paths,
+            "top_k_chunks": top_k_chunks,
+            "top_k_paths": top_k_paths,
             **payload.metadata,
         },
     )
@@ -70,18 +65,36 @@ async def create_document(
 ) -> DocumentRunResponse:
     domain_request = _to_domain_request(payload)
     run = await workflow.create_document_run(domain_request)
-    return DocumentRunResponse.model_validate(run)
+    if not payload.auto_generate:
+        return DocumentRunResponse.model_validate(run)
+    run, errors = await workflow.generate_all_sections(run["run_id"])
+    response = DocumentRunResponse.model_validate(run)
+    if errors:
+        response.auto_generate_errors = errors
+    return response
 
 
-@router.get("", response_model=list[DocumentRunResponse])
-async def list_documents(
+@router.post("/{run_id}/generate-all", response_model=DocumentRunResponse)
+async def generate_all_sections(
+    run_id: str,
     workflow: Annotated[DocumentWorkflowEngine, Depends(get_workflow)],
-    limit: int = 50,
-) -> list[DocumentRunResponse]:
-    return [
-        DocumentRunResponse.model_validate(run)
-        for run in await workflow.list_runs(limit=limit)
-    ]
+) -> DocumentRunResponse:
+    """Generate all pending sections for an existing run in one call.
+
+    Sections already at ``review_ready`` or ``approved`` are skipped.
+    On partial failure the response still returns the run (with sections
+    generated so far) and surfaces the errors in ``auto_generate_errors``.
+    """
+    try:
+        run, errors = await workflow.generate_all_sections(run_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    response = DocumentRunResponse.model_validate(run)
+    if errors:
+        response.auto_generate_errors = errors
+    return response
 
 
 @router.post("/{run_id}/generate", response_model=SectionResponse)
@@ -114,6 +127,49 @@ async def regenerate_section(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
+@router.post(
+    "/{run_id}/sections/{section_name}/approve", response_model=SectionResponse
+)
+async def approve_section(
+    run_id: str,
+    section_name: str,
+    payload: ApproveSectionRequest,
+    workflow: Annotated[DocumentWorkflowEngine, Depends(get_workflow)],
+) -> SectionResponse:
+    try:
+        return SectionResponse.model_validate(
+            await workflow.approve_section(run_id, section_name, payload.notes)
+        )
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.post("/{run_id}/export", response_model=ExportResponse)
+async def export_document(
+    run_id: str,
+    payload: ExportRequest,
+    workflow: Annotated[DocumentWorkflowEngine, Depends(get_workflow)],
+) -> ExportResponse:
+    try:
+        result = await workflow.export_document(
+            run_id, output_format=payload.output_format
+        )
+        return ExportResponse.model_validate(result)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.get("", response_model=list[DocumentRunResponse], include_in_schema=False)
+async def list_documents(
+    workflow: Annotated[DocumentWorkflowEngine, Depends(get_workflow)],
+    limit: int = 50,
+) -> list[DocumentRunResponse]:
+    return [
+        DocumentRunResponse.model_validate(run)
+        for run in await workflow.list_runs(limit=limit)
+    ]
+
+
 @router.get("/dashboard", response_class=HTMLResponse, include_in_schema=False)
 async def runs_dashboard(
     workflow: Annotated[DocumentWorkflowEngine, Depends(get_workflow)],
@@ -124,7 +180,7 @@ async def runs_dashboard(
     return HTMLResponse(content=render_dashboard_html(runs, limit=limit))
 
 
-@router.get("/{run_id}", response_model=DocumentRunResponse)
+@router.get("/{run_id}", response_model=DocumentRunResponse, include_in_schema=False)
 async def get_document(
     run_id: str,
     workflow: Annotated[DocumentWorkflowEngine, Depends(get_workflow)],
@@ -135,7 +191,9 @@ async def get_document(
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
-@router.get("/{run_id}/sections", response_model=list[SectionResponse])
+@router.get(
+    "/{run_id}/sections", response_model=list[SectionResponse], include_in_schema=False
+)
 async def list_sections(
     run_id: str,
     workflow: Annotated[DocumentWorkflowEngine, Depends(get_workflow)],
@@ -149,7 +207,11 @@ async def list_sections(
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
-@router.get("/{run_id}/sections/{section_name}", response_model=SectionResponse)
+@router.get(
+    "/{run_id}/sections/{section_name}",
+    response_model=SectionResponse,
+    include_in_schema=False,
+)
 async def get_section(
     run_id: str,
     section_name: str,
@@ -176,24 +238,11 @@ async def preview_document(
     return HTMLResponse(content=render_preview_html(run))
 
 
-@router.post(
-    "/{run_id}/sections/{section_name}/approve", response_model=SectionResponse
+@router.get(
+    "/{run_id}/retrieval-passes",
+    response_model=list[RetrievalPassResponse],
+    include_in_schema=False,
 )
-async def approve_section(
-    run_id: str,
-    section_name: str,
-    payload: ApproveSectionRequest,
-    workflow: Annotated[DocumentWorkflowEngine, Depends(get_workflow)],
-) -> SectionResponse:
-    try:
-        return SectionResponse.model_validate(
-            await workflow.approve_section(run_id, section_name, payload.notes)
-        )
-    except KeyError as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
-
-
-@router.get("/{run_id}/retrieval-passes", response_model=list[RetrievalPassResponse])
 async def list_retrieval_passes(
     run_id: str,
     workflow: Annotated[DocumentWorkflowEngine, Depends(get_workflow)],
@@ -205,7 +254,7 @@ async def list_retrieval_passes(
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
-@router.get("/{run_id}/events")
+@router.get("/{run_id}/events", include_in_schema=False)
 async def get_events(
     run_id: str,
     workflow: Annotated[DocumentWorkflowEngine, Depends(get_workflow)],
@@ -214,18 +263,3 @@ async def get_events(
         return await workflow.get_events(run_id)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
-
-
-@router.post("/{run_id}/export", response_model=ExportResponse)
-async def export_document(
-    run_id: str,
-    payload: ExportRequest,
-    workflow: Annotated[DocumentWorkflowEngine, Depends(get_workflow)],
-) -> ExportResponse:
-    try:
-        result = await workflow.export_document(
-            run_id, output_format=payload.output_format
-        )
-        return ExportResponse.model_validate(result)
-    except Exception as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc

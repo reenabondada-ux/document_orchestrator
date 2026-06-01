@@ -22,7 +22,6 @@ if __name__ == "__main__":
     orchestrator = DocumentOrchestrator(retrieval_client=retrieval, llm_client=llm)
     req = DocumentRequest(
         system_id="ACME_MAINFRAME_POC",
-        user_role="analyst",
         topic="Create system appreciation document for the billing flow",
         retrieval_request=RetrievalRequest(
             query=pack.question,
