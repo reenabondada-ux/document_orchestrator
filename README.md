@@ -13,7 +13,6 @@ mainframe_doc_orchestrator/
   clients/            # LLM and retrieval adapters
   persistence/        # Postgres repositories (AsyncConnectionPool)
   services/           # Workflow engine, prompt engine, draft writer, exporter
-  schemas/            # JSON schema artifacts
 docs/                 # Architecture and API documentation
 tests/
 ```
