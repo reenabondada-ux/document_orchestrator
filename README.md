@@ -79,17 +79,17 @@ idempotently (`ADD COLUMN IN NOT EXISTS`, etc.) so re-runs are safe.
 ### 5. Start the API
 
 ```bash
-uvicorn mainframe_doc_orchestrator.api.app:app --host 0.0.0.0 --port 8002 --reload
+uvicorn mainframe_doc_orchestrator.api.app:app --host 0.0.0.0 --port 8010 --reload
 ```
 
 Once running, the API is available at:
 
 | Resource | URL |
 |---|---|
-| API base | `http://localhost:8002` |
-| Interactive docs (Swagger UI) | `http://localhost:8002/docs` |
-| OpenAPI schema (JSON) | `http://localhost:8002/openapi.json` |
-| Dashboard | `http://localhost:8002/documents/dashboard` |
+| API base | `http://localhost:8010` |
+| Interactive docs (Swagger UI) | `http://localhost:8010/docs` |
+| OpenAPI schema (JSON) | `http://localhost:8010/openapi.json` |
+| Dashboard | `http://localhost:8010/documents/dashboard` |
 
 ## API surface
 
