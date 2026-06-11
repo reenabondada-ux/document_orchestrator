@@ -9,6 +9,12 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Any
 
+from mainframe_doc_orchestrator.contracts import (
+    DocumentRepository,
+    LLMClient,
+    RetrievalClient,
+    RetrievalPassStore,
+)
 from mainframe_doc_orchestrator.models import (
     DocumentDraft,
     DocumentPlan,
@@ -39,10 +45,10 @@ class DocumentWorkflowEngine:
     def __init__(
         self,
         *,
-        retrieval_client,
-        llm_client,
-        document_repository,
-        retrieval_pass_repository,
+        retrieval_client: RetrievalClient,
+        llm_client: LLMClient,
+        document_repository: DocumentRepository,
+        retrieval_pass_repository: RetrievalPassStore,
         planner: MainframeDocumentPlanner | None = None,
         validator: MainframeEvidenceValidator | None = None,
         exporter: DocumentExporter | None = None,
@@ -104,7 +110,7 @@ class DocumentWorkflowEngine:
                 dep: sections[dep].draft_markdown for dep in section.depends_on
             }
 
-        prior_pass_count = await self.retrieval_pass_repository.next_pass_number(
+        next_pass_num = await self.retrieval_pass_repository.next_pass_number(
             run_id, section.section_name
         )
         retrieval_request = self._build_retrieval_request(section, sections, plan_dict)
@@ -151,7 +157,7 @@ class DocumentWorkflowEngine:
             retrieval_pass = await self.retrieval_pass_repository.create_pass(
                 run_id=run_id,
                 section_name=section.section_name,
-                pass_number=prior_pass_count,
+                pass_number=next_pass_num,
                 query=retrieval_request.query,
                 evidence_request_id=None,
                 status="in_progress",
@@ -168,7 +174,7 @@ class DocumentWorkflowEngine:
             request=request,
             section=section,
             evidence_pack=evidence_pack,
-            prior_pass_count=prior_pass_count - 1,
+            prior_pass_count=next_pass_num - 1,
             prior_drafts=prior_drafts,
         )
         notes = self.validator.validate_section(section_markdown, evidence_pack)
@@ -180,7 +186,7 @@ class DocumentWorkflowEngine:
         section.confidence = evidence_pack.confidence
         section.notes = notes
         section.retrieval_pass_id = retrieval_pass["pass_id"]
-        section.retrieval_pass_number = prior_pass_count
+        section.retrieval_pass_number = next_pass_num
         section.evidence_overview = answer_summary
         section.discovered_asset_ids = self._harvest_asset_ids(
             evidence_pack, section.cascade_node_types
