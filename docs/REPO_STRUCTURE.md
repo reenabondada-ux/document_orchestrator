@@ -20,9 +20,5 @@
   - end-to-end document generation workflow
 - `mainframe_doc_orchestrator/cli.py`
   - local execution entry point
-- `schemas/`
-  - JSON schemas for orchestrator artifacts
-- `templates/`
-  - system appreciation document template
 - `docs/`
   - build order and design notes

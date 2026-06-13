@@ -4,10 +4,10 @@ Both classes accept a ``psycopg_pool.AsyncConnectionPool`` which is created
 once during the application lifespan (see ``api/app.py``) and injected via
 ``api/dependencies.py``.  All public methods are async and must be awaited.
 """
+
 from __future__ import annotations
 
 import json
-from datetime import datetime, timezone
 from typing import Any
 from uuid import uuid4
 
@@ -18,7 +18,15 @@ class PostgresDocumentRepository:
     def __init__(self, pool: psycopg_pool.AsyncConnectionPool) -> None:
         self._pool = pool
 
-    async def create_run(self, *, run_id: str, document_title: str, system_id: str, plan: dict[str, Any], status: str) -> dict[str, Any]:
+    async def create_run(
+        self,
+        *,
+        run_id: str,
+        document_title: str,
+        system_id: str,
+        plan: dict[str, Any],
+        status: str,
+    ) -> dict[str, Any]:
         async with self._pool.connection() as conn:
             async with conn.cursor() as cur:
                 await cur.execute(
@@ -93,6 +101,20 @@ class PostgresDocumentRepository:
         sql = f"UPDATE document_runs SET {', '.join(fields)} WHERE run_id = %s RETURNING run_id, document_title, system_id, plan, status, created_at, completed_at, export_artifact"
         async with self._pool.connection() as conn:
             async with conn.cursor() as cur:
+                # Row-level lock to serialize concurrent writers for this run.
+                await cur.execute(
+                    """
+                    SELECT run_id
+                    FROM document_runs
+                    WHERE run_id = %s
+                    FOR UPDATE
+                    """,
+                    (run_id,),
+                )
+                locked = await cur.fetchone()
+                if locked is None:
+                    raise KeyError(f"Document run not found: {run_id}")
+
                 await cur.execute(sql, values)
                 row = await cur.fetchone()
             await conn.commit()
@@ -109,27 +131,25 @@ class PostgresDocumentRepository:
                 return section
         raise KeyError(f"Section not found: {section_name}")
 
-    async def update_section(self, run_id: str, section_name: str, patch: dict[str, Any]) -> dict[str, Any]:
-        run = await self.get_run(run_id)
-        plan = run["plan"]
-        for section in plan.get("sections", []):
-            if section.get("section_name") == section_name:
-                section.update(patch)
-                section["updated_at"] = patch.get("updated_at", datetime.now(timezone.utc).isoformat())
-                break
-        else:
-            raise KeyError(f"Section not found: {section_name}")
-        return await self.update_run(run_id, plan=plan)
-
     @staticmethod
     def _row_to_run(row: Any) -> dict[str, Any]:
         if row is None:
             raise KeyError("Expected row, got None")
-        keys = ["run_id", "document_title", "system_id", "plan", "status", "created_at", "completed_at", "export_artifact"]
+        keys = [
+            "run_id",
+            "document_title",
+            "system_id",
+            "plan",
+            "status",
+            "created_at",
+            "completed_at",
+            "export_artifact",
+        ]
         data = dict(zip(keys, row)) if not isinstance(row, dict) else row
         # psycopg returns JSONB columns as Python dicts; ensure plan is always a dict
         if isinstance(data.get("plan"), str):
             import json as _json
+
             data["plan"] = _json.loads(data["plan"])
         return data
 
@@ -152,7 +172,16 @@ class RetrievalPassRepository:
                 row = await cur.fetchone()
         return int(row[0] or 0) + 1
 
-    async def create_pass(self, *, run_id: str, section_name: str, pass_number: int, query: str, evidence_request_id: str | None, status: str) -> dict[str, Any]:
+    async def create_pass(
+        self,
+        *,
+        run_id: str,
+        section_name: str,
+        pass_number: int,
+        query: str,
+        evidence_request_id: str | None,
+        status: str,
+    ) -> dict[str, Any]:
         pass_id = str(uuid4())
         async with self._pool.connection() as conn:
             async with conn.cursor() as cur:
@@ -162,13 +191,23 @@ class RetrievalPassRepository:
                     VALUES (%s, %s, %s, %s, %s, %s, %s)
                     RETURNING pass_id, run_id, section_name, pass_number, query, evidence_request_id, status, created_at
                     """,
-                    (pass_id, run_id, section_name, pass_number, query, evidence_request_id, status),
+                    (
+                        pass_id,
+                        run_id,
+                        section_name,
+                        pass_number,
+                        query,
+                        evidence_request_id,
+                        status,
+                    ),
                 )
                 row = await cur.fetchone()
             await conn.commit()
         return self._row_to_pass(row)
 
-    async def complete_pass(self, *, pass_id: str, evidence_request_id: str, status: str = "completed") -> dict[str, Any]:
+    async def complete_pass(
+        self, *, pass_id: str, evidence_request_id: str, status: str = "completed"
+    ) -> dict[str, Any]:
         async with self._pool.connection() as conn:
             async with conn.cursor() as cur:
                 await cur.execute(
@@ -230,6 +269,15 @@ class RetrievalPassRepository:
     def _row_to_pass(row: Any) -> dict[str, Any]:
         if row is None:
             raise KeyError("Expected row, got None")
-        keys = ["pass_id", "run_id", "section_name", "pass_number", "query", "evidence_request_id", "status", "created_at"]
+        keys = [
+            "pass_id",
+            "run_id",
+            "section_name",
+            "pass_number",
+            "query",
+            "evidence_request_id",
+            "status",
+            "created_at",
+        ]
         data = dict(zip(keys, row)) if not isinstance(row, dict) else row
         return data

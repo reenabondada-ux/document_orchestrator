@@ -10,7 +10,7 @@ All clients expose ``async def generate()``.
 from __future__ import annotations
 
 import asyncio
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import httpx
 
@@ -24,7 +24,7 @@ class EchoLLMClient:
         self.max_output_tokens = max_output_tokens
         self.temperature = temperature
 
-    async def generate(self, *, system_prompt: str, user_prompt: str) -> str:
+    async def generate(self, *, system_prompt: str, user_prompt: str, max_tokens: int | None = None) -> str:
         return (
             "# Echo Model Output\n\n"
             f"## System Prompt\n{system_prompt}\n\n"
@@ -48,8 +48,9 @@ class OpenAICompatibleLLMClient:
         self.timeout = timeout
         self.max_output_tokens = max_output_tokens
         self.temperature = temperature
+        self._client = httpx.AsyncClient(timeout=self.timeout)
 
-    async def generate(self, *, system_prompt: str, user_prompt: str) -> str:
+    async def generate(self, *, system_prompt: str, user_prompt: str, max_tokens: int | None = None) -> str:
         payload = {
             "model": self.model_name,
             "messages": [
@@ -57,19 +58,21 @@ class OpenAICompatibleLLMClient:
                 {"role": "user", "content": user_prompt},
             ],
             "temperature": self.temperature,
-            "max_tokens": self.max_output_tokens,
+            "max_tokens": max_tokens or self.max_output_tokens,
         }
         headers: dict[str, str] = {"Content-Type": "application/json"}
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"
-        async with httpx.AsyncClient(timeout=self.timeout) as client:
-            response = await client.post(
-                f"{self.base_url}/chat/completions",
-                json=payload,
-                headers=headers,
-            )
+        response = await self._client.post(
+            f"{self.base_url}/chat/completions",
+            json=payload,
+            headers=headers,
+        )
         response.raise_for_status()
         return response.json()["choices"][0]["message"]["content"]
+
+    async def aclose(self) -> None:
+        await self._client.aclose()
 
 
 class BedrockLLMClient:
@@ -80,25 +83,25 @@ class BedrockLLMClient:
         self.region_name = region_name
         self.max_output_tokens = max_output_tokens
         self.temperature = temperature
+        try:
+            import boto3
+        except ImportError as exc:
+            raise RuntimeError("boto3 is required for BedrockLLMClient") from exc
+        self._client: Any = boto3.client("bedrock-runtime", region_name=self.region_name)
 
-    async def generate(self, *, system_prompt: str, user_prompt: str) -> str:
+    async def generate(self, *, system_prompt: str, user_prompt: str, max_tokens: int | None = None) -> str:
         return await asyncio.to_thread(
             self._generate_sync,
             system_prompt,
             user_prompt,
             self.temperature,
-            self.max_output_tokens,
+            max_tokens or self.max_output_tokens,
         )
 
     def _generate_sync(
         self, system_prompt: str, user_prompt: str, temperature: float, max_tokens: int
     ) -> str:
-        try:
-            import boto3
-        except ImportError as exc:
-            raise RuntimeError("boto3 is required for BedrockLLMClient") from exc
-        client = boto3.client("bedrock-runtime", region_name=self.region_name)
-        response = client.converse(
+        response = self._client.converse(
             modelId=self.model_name,
             system=system_prompt,
             messages=[{"role": "user", "content": [{"text": user_prompt}]}],

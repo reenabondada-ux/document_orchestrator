@@ -17,6 +17,7 @@ Usage (Uvicorn)::
 
 from __future__ import annotations
 
+import inspect
 import logging
 from contextlib import asynccontextmanager
 from typing import AsyncGenerator
@@ -59,10 +60,18 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     app.state.llm_client = llm_client
     app.state.retrieval_client = retrieval_client
 
-    yield
-
-    logger.info("Document Orchestrator API: shutting down")
-    await pg_pool.close()
+    try:
+        yield
+    finally:
+        logger.info("Document Orchestrator API: shutting down")
+        for client in (llm_client, retrieval_client):
+            close_fn = getattr(client, "aclose", None)
+            if close_fn is None:
+                continue
+            result = close_fn()
+            if inspect.isawaitable(result):
+                await result
+        await pg_pool.close()
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:

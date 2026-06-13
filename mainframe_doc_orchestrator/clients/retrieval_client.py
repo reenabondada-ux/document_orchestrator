@@ -15,6 +15,7 @@ if TYPE_CHECKING:
     from mainframe_doc_orchestrator.contracts import RetrievalClient
 
 from mainframe_doc_orchestrator.models import ChunkContent, EvidenceItem, EvidencePack, GraphPath, GraphPathEdge, GraphPathNode, RetrievalRequest
+from mainframe_doc_orchestrator.settings import Settings
 
 
 class HttpRetrievalClient:
@@ -24,6 +25,7 @@ class HttpRetrievalClient:
             evidence_endpoint_template or endpoint.rstrip("/") + "/evidence-packs/{request_id}"
         )
         self.timeout = timeout
+        self._client = httpx.AsyncClient(timeout=self.timeout)
 
     async def retrieve(self, request: RetrievalRequest) -> EvidencePack:
         payload = {
@@ -34,8 +36,7 @@ class HttpRetrievalClient:
             "top_k_paths": request.top_k_paths,
             "filters": asdict(request.filters),
         }
-        async with httpx.AsyncClient(timeout=self.timeout) as client:
-            response = await client.post(self.endpoint, json=payload)
+        response = await self._client.post(self.endpoint, json=payload)
         response.raise_for_status()
         # POST /v1/retrieve returns RetrievalResponse {request_id, query, confidence, evidence_pack}
         # The evidence_pack is nested — unwrap it.
@@ -43,10 +44,12 @@ class HttpRetrievalClient:
 
     async def fetch_evidence_pack(self, evidence_request_id: str) -> EvidencePack:
         url = self.evidence_endpoint_template.format(request_id=evidence_request_id)
-        async with httpx.AsyncClient(timeout=self.timeout) as client:
-            response = await client.get(url)
+        response = await self._client.get(url)
         response.raise_for_status()
         return evidence_pack_from_dict(response.json())
+
+    async def aclose(self) -> None:
+        await self._client.aclose()
 
 
 class RetrievalClientStub:
@@ -106,7 +109,7 @@ def evidence_pack_from_dict(data: dict[str, Any]) -> EvidencePack:
     )
 
 
-def retrieval_client_from_settings(settings: object) -> "RetrievalClient":
+def retrieval_client_from_settings(settings: Settings) -> "RetrievalClient":
     """Instantiate the correct retrieval client from application settings.
 
     Set ``RETRIEVAL_PROVIDER`` to one of: ``http``, ``stub``.
@@ -115,10 +118,10 @@ def retrieval_client_from_settings(settings: object) -> "RetrievalClient":
     Raises:
         ValueError: If the provider is unrecognised or a required variable is missing.
     """
-    provider = settings.retrieval_provider.lower()  # type: ignore[union-attr]
+    provider = settings.retrieval_provider.lower()
 
     if provider == "stub":
-        stub_path = settings.retrieval_stub_path  # type: ignore[union-attr]
+        stub_path = settings.retrieval_stub_path
         if not stub_path:
             raise ValueError("RETRIEVAL_STUB_PATH is required for the stub retrieval provider")
         from pathlib import Path
@@ -129,16 +132,16 @@ def retrieval_client_from_settings(settings: object) -> "RetrievalClient":
         return RetrievalClientStub(pack)
 
     if provider == "http":
-        endpoint = settings.retrieval_endpoint  # type: ignore[union-attr]
+        endpoint = settings.retrieval_endpoint
         if not endpoint:
             raise ValueError("RETRIEVAL_ENDPOINT is required for the http retrieval provider")
         return HttpRetrievalClient(
             endpoint=endpoint,
-            evidence_endpoint_template=settings.retrieval_evidence_endpoint_template,  # type: ignore[union-attr]
-            timeout=settings.retrieval_timeout,  # type: ignore[union-attr]
+            evidence_endpoint_template=settings.retrieval_evidence_endpoint_template,
+            timeout=settings.retrieval_timeout,
         )
 
     raise ValueError(
-        f"Unsupported RETRIEVAL_PROVIDER: '{settings.retrieval_provider}'. "  # type: ignore[union-attr]
+        f"Unsupported RETRIEVAL_PROVIDER: '{settings.retrieval_provider}'. "
         "Valid options: 'http', 'stub'."
     )

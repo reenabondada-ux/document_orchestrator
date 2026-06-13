@@ -1,6 +1,14 @@
 from __future__ import annotations
+
 import re
+
 from mainframe_doc_orchestrator.models import EvidencePack
+
+
+# Match asset-like identifiers only (e.g. JCL__JOB1, COBOL__PROG_A).
+# Requiring "__" avoids treating generic uppercase prose tokens (JCL, API, SQL)
+# as candidate asset IDs.
+ASSET_ID_PATTERN = re.compile(r"\b[A-Z][A-Z0-9]*__[A-Z0-9_]+\b")
 
 
 class MainframeEvidenceValidator:
@@ -16,7 +24,7 @@ class MainframeEvidenceValidator:
             warnings.append("No supporting chunks returned.")
         if not evidence_pack.graph_paths:
             warnings.append("No graph paths returned.")
-        claimed_ids = re.findall(r"\b[A-Z][A-Z0-9_]{2,}\b", section_markdown)
+        claimed_ids = ASSET_ID_PATTERN.findall(section_markdown)
         known_ids = {
             content.asset_id for content in evidence_pack.chunk_contents.values()
         }

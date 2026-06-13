@@ -5,14 +5,13 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
-# Maps caller-supplied JCL complexity hint to a recommended top_k_paths value.
-# simple  — 1-2 steps, 1 program each, few copybooks  (~9 leaf paths)
-# medium  — 3-5 steps, 1-2 programs, moderate copybooks (~15 leaf paths)
-# complex — 5+ steps, multiple programs, many copybooks (~25 leaf paths)
-JCL_COMPLEXITY_TOP_K: dict[str, int] = {
-    "simple": 9,
-    "medium": 15,
-    "complex": 25,
+# Maps complexity level → (top_k_chunks, top_k_paths).
+# top_k_chunks: number of text chunks retrieved per section.
+# top_k_paths:  number of graph execution paths retrieved per section.
+COMPLEXITY_RETRIEVAL_PARAMS: dict[str, tuple[int, int]] = {
+    "simple":  (10, 10),
+    "medium":  (20, 20),
+    "complex": (35, 35),
 }
 
 
@@ -33,21 +32,24 @@ class RetrievalRequestModel(BaseModel):
 
 class DocumentCreateRequest(BaseModel):
     system_id: str
-    document_title: str | None = None
-    document_type: str = "system_appreciation"
-    user_role: str = "analyst"
+    document_type: Literal["system_appreciation", "jcl_analysis"] = "system_appreciation"
     topic: str = ""
-    scope: str = ""
-    section_order: list[str] = Field(default_factory=list)
-    top_k_chunks: int = 8
-    # Explicit override — takes precedence over jcl_complexity when provided.
-    top_k_paths: int | None = None
-    # Convenience hint: drives top_k_paths when top_k_paths is not explicitly set.
-    # simple=9, medium=15 (default), complex=25
-    jcl_complexity: Literal["simple", "medium", "complex"] = "medium"
+    complexity: Literal["simple", "medium", "complex"] = Field(
+        default="medium",
+        description=(
+            "Complexity of the assets being analysed. Drives top_k_chunks and top_k_paths "
+            "automatically: simple=(10,10), medium=(20,20), complex=(35,35). "
+            "Provide asset_ids or asset_types in filters to scope retrieval; both are optional "
+            "but at least one is strongly recommended for multi-job estates."
+        ),
+    )
     filters: RetrievalFiltersModel = Field(default_factory=RetrievalFiltersModel)
-    retrieval_request: RetrievalRequestModel | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
+    auto_generate: bool = Field(
+        default=False,
+        description="When True, all sections are generated sequentially before returning. "
+                    "On partial failure the run is still returned with errors listed in auto_generate_errors.",
+    )
 
 
 class GenerateRequest(BaseModel):
@@ -89,6 +91,11 @@ class DocumentRunResponse(BaseModel):
     completed_at: datetime | str | None = None
     plan: dict[str, Any]
     export_artifact: dict[str, Any] | None = None
+    auto_generate_errors: list[dict[str, Any]] | None = Field(
+        default=None,
+        description="Populated only when auto_generate=True and one or more sections "
+                    "failed. Each entry contains section_name and error.",
+    )
 
 
 class RetrievalPassResponse(BaseModel):
@@ -106,3 +113,4 @@ class ExportResponse(BaseModel):
     run_id: str
     format: str
     content: str
+    file_path: str | None = None
