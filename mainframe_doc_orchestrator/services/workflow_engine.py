@@ -6,6 +6,7 @@ calls are never made synchronously; the event loop is never blocked.
 
 from __future__ import annotations
 
+import logging
 from datetime import datetime, timezone
 from typing import Any
 
@@ -36,6 +37,8 @@ from mainframe_doc_orchestrator.serialization import (
     sections_map_to_stored_sections_list,
     stored_sections_list_to_sections_map,
 )
+
+logger = logging.getLogger(__name__)
 
 
 SUMMARY_PREVIEW_LIMIT = 5
@@ -268,6 +271,11 @@ class DocumentWorkflowEngine:
             try:
                 await self.generate_section(run_id, section_name)
             except Exception as exc:  # noqa: BLE001
+                logger.exception(
+                    "generate_section failed run_id=%s section=%s",
+                    run_id,
+                    section_name,
+                )
                 errors.append({"section_name": section_name, "error": str(exc)})
                 # Stop: later sections may depend on this one.
                 break

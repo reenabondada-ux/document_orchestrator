@@ -20,10 +20,27 @@ tests/
 ## Prerequisites
 
 - Python 3.11+
-- PostgreSQL 14+
+- PostgreSQL 14+ (or use Docker — see [Docker Deployment](#docker-deployment))
 - A running instance of the mainframe retrieval API (see `RETRIEVAL_ENDPOINT` in `.env`)
 
-## Setup
+## Docker Deployment
+
+**Recommended for development** — runs the orchestrator app container and connects to the shared Postgres on port 5432:
+
+```bash
+# Build and start app service
+docker compose up -d
+
+# View logs
+docker compose logs -f document-orchestrator-app
+
+# Access API
+open http://localhost:8010/docs
+```
+
+See [docs/DOCKER_DEPLOYMENT.md](docs/DOCKER_DEPLOYMENT.md) for full details, troubleshooting, and production deployment patterns.
+
+## Local Setup (Alternative to Docker)
 
 ### 1. Create and activate a virtual environment
 

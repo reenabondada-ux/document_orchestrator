@@ -1,0 +1,38 @@
+services:
+  document-orchestrator-app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: document-orchestrator-app
+    env_file:
+      - .env
+    extra_hosts:
+      - "host.docker.internal:host-gateway"  # Force IPv4 resolution so httpx can reach host-bound services (e.g. mainframe-rag-app:8001)
+    environment:
+      # Shared Postgres from rag-aws-portfolio on docker_default network.
+      # Use service name "postgres" because this compose no longer runs its own DB.
+      POSTGRES_DSN: postgresql://${POSTGRES_USER:-postgres_user}:${POSTGRES_PASSWORD:-postgres_pass}@postgres:5432/${POSTGRES_DB:-postgres_db}
+      # Hardcoded Docker service name — avoids .env localhost values being substituted at parse time.
+      # Both containers share docker_default network, so direct container-to-container communication works.
+      # RETRIEVAL_ENDPOINT: "http://mainframe-rag-app:8001/v1/retrieve"
+      # RETRIEVAL_EVIDENCE_ENDPOINT_TEMPLATE: "http://mainframe-rag-app:8001/v1/evidence-packs/{request_id}"
+      RETRIEVAL_ENDPOINT: "http://localhost:8001/v1/retrieve"
+      RETRIEVAL_EVIDENCE_ENDPOINT_TEMPLATE: "http://localhost:8001/v1/evidence-packs/{request_id}"
+    ports:
+      - '8010:8010'
+    networks:
+      - default
+      - rag_network
+    healthcheck:
+      test: ['CMD-SHELL', 'curl -f http://localhost:8010/docs || exit 1']
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+networks:
+  default:
+    name: document_orchestrator_default
+  rag_network:
+    external: true
+    name: docker_default  # rag-aws-portfolio network (project name = infra/docker/ dir)
